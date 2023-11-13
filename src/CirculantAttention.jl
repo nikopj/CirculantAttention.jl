@@ -17,9 +17,6 @@ include("similarity.jl")
 export circulant_similarity, circulant_similarity!, DotSimilarity, DistanceSimilarity
 export circulant_adjacency, circulant_adjacency!
 
-# include("convex_comb.jl")
-# export convex_comb
-
 include("attention.jl")
 export circulant_attention, circulant_mh_attention, circulant_mh_adjacency, ⊗, ⨷
 

@@ -84,11 +84,16 @@ function circulant_softmax!(Y::CuSparseArrayCSR, X::CuSparseArrayCSR=Y)
     return Y
 end
 circulant_softmax(X::CuSparseArrayCSR) = circulant_softmax!(copy(X), X)
+
 function NNlib.softmax!(A::Circulant{T,N,M}, B::Circulant{T,N,M}=A) where {T,N,M} 
     circulant_softmax!(A.data, B.data)
     return A
 end
-NNlib.softmax(A::Circulant) = NNlib.softmax!(copy(A), A)
+
+function NNlib.softmax(A::Circulant) 
+    data = circulant_softmax(A.data)
+    return Circulant(data, kernel_length(A), spatial_size(A))
+end
 
 function circulant_similarity(simfun::AbstractSimilarity, x::AbstractArray{T,N}, y::AbstractArray{T,N}, W::Integer)::Circulant where {T,N}
     S = Circulant(W, (size(x)[1:N-2]..., 1, size(x, N)))

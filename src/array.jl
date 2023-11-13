@@ -57,22 +57,58 @@ function Base.cat(As::Circulant{T, N, M}...; dims=3) where {T, N, M}
     Circulant(cat([A.data for A in As]...; dims=dims), M, spatial_size(A))
 end
 
-function Base.:(+)(A::Circulant{T, N, M, S}, B::Circulant{T, N, M, S}) where {T, N, M, S<:CuSparseArrayCSR}
-    data = CuSparseArrayCSR(copy(A.data.rowPtr), copy(A.data.colVal), A.data.nzVal + B.data.nzVal, size(A))
-    Circulant(data, M, spatial_size(A))
+function Base.:(+)(X::Circulant{T, N, M, S, A}, Y::Circulant{T, N, M, S, A}) where {T, N, M, S, A<:CuSparseArrayCSR}
+    data = CuSparseArrayCSR(copy(X.data.rowPtr), copy(X.data.colVal), X.data.nzVal + Y.data.nzVal, size(X))
+    Circulant(data, M, spatial_size(X))
 end
 
-function Base.:(-)(A::Circulant{T, N, M, S}, B::Circulant{T, N, M, S}) where {T, N, M, S<:CuSparseArrayCSR}
-    data = CuSparseArrayCSR(copy(A.data.rowPtr), copy(A.data.colVal), A.data.nzVal - B.data.nzVal, size(A))
-    Circulant(data, M, spatial_size(A))
+function Base.:(-)(X::Circulant{T, N, M, S, A}, Y::Circulant{T, N, M, S, A}) where {T, N, M, S, A<:CuSparseArrayCSR}
+    data = CuSparseArrayCSR(copy(X.data.rowPtr), copy(X.data.colVal), X.data.nzVal - Y.data.nzVal, size(X))
+    Circulant(data, M, spatial_size(X))
 end
 
-function Base.:(*)(c::Number, A::Circulant{T, N, M, S}) where {T, N, M, S <: CuSparseArrayCSR}
-    data = CuSparseArrayCSR(copy(A.data.rowPtr), copy(A.data.colVal), c .* A.data.nzVal, size(A))
-    Circulant(data, M, spatial_size(A))
+function Base.:(*)(c::Number, X::Circulant{T, N, M, S, A}) where {T, N, M, S, A <: CuSparseArrayCSR}
+    data = CuSparseArrayCSR(copy(X.data.rowPtr), copy(X.data.colVal), c .* X.data.nzVal, size(X))
+    Circulant(data, M, spatial_size(X))
 end
 Base.:(-)(A::Circulant) = -1*A
 Base.:(*)(A::Circulant, c::Number) = c*A
+
+function LinearAlgebra.dot(X::Circulant{T, N, M, S, A}, Y::Circulant{T, N, M, S, A}) where {T, N, M, S, A <: CuSparseArrayCSR}
+    return dot(X.data.nzVal, Y.data.nzVal)
+end
+
+function Base.:(==)(A::CuSparseArrayCSR, B::CuSparseArrayCSR)
+    if axes(A) != axes(B)
+        return false
+    end
+    if A.nzVal != B.nzVal
+        return false
+    end
+    if A.rowPtr != B.rowPtr
+        return false
+    end
+    if A.colVal != B.colVal
+        return false
+    end
+    return true
+end
+
+function Base.:(==)(A::Circulant, B::Circulant)
+    if axes(A) != axes(B)
+        return false
+    end
+    if spatial_size(A) != spatial_size(B)
+        return false
+    end
+    if kernel_length(A) != kernel_length(B)
+        return false
+    end
+    if A.data != B.data
+        return false
+    end
+    return true
+end
 
 function sumdim1(A::CuSparseArrayCSR{T}) where T
     o = CUDA.ones(T, (size(A,1), 2, prod(size(A)[3:end])))

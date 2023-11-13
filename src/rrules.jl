@@ -27,10 +27,13 @@ function CRC.rrule(::typeof(circulant_similarity), ::DotSimilarity, x::AbstractA
     return S, dot_sim_pullback
 end
 
+_collect_reshapedarray(A::Base.ReshapedArray) = reshape(A.parent, A.dims...)
+_collect_reshapedarray(A::AbstractArray) = A
+
 function CRC.rrule(::typeof(NNlib.softmax), X::Circulant{T, N, M}) where {T, N, M}
     Y = NNlib.softmax(X)
     function softmax_pullback(∂Y) 
-        ΔY = CRC.unthunk(∂Y)
+        ΔY = CRC.unthunk(∂Y) |> _collect_reshapedarray
         dUr = reshape(ΔY.data.nzVal, :, size(ΔY,1), prod(size(ΔY)[3:end]))
         Ur  = reshape(Y.data.nzVal, :, size(X,1), prod(size(X)[3:end]))
         dVr = NNlib.∇softmax_data(dUr, Ur; dims=1)

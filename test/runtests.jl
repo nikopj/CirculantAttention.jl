@@ -14,4 +14,5 @@ include("utils.jl")
 
 @testset "CirculantAttention.jl" begin
     include("rrule.jl")
+    include("grad.jl")
 end

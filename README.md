@@ -10,7 +10,7 @@
 - [x] dot-product attention
 - [x] multi-head attention
 - [ ] example usage and documentation
-- [ ] convex combination
-- [ ] tests
+- [x] convex combination
+- [x] tests
 - [x] rrules
 - [x] rrule tests

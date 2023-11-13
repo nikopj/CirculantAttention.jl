@@ -1,0 +1,102 @@
+struct Circulant{T, N, M, S, A<:AbstractArray{T, N}} <: AbstractArray{T, N}
+    data::A
+    spatial_size::NTuple{S, Int}
+
+    function Circulant(M::Int, dims::NTuple{N,Int}) where N
+        Circulant{Float32}(M, dims)
+    end
+    function Circulant{T}(M::Int, dims::NTuple{N,Int}) where {T,N}
+        spatsize, batchsize = dims[1:N-2], dims[N-1:end]
+        data = cucirculant(M, spatsize..., T)
+        data = repeat(data, 1, 1, batchsize...)
+        Circulant(data, M, spatsize)
+    end
+    function Circulant(D::A, M::Int, spatsize::NTuple{S,Int}) where {T, N, S, A<:AbstractArray{T,N}}
+        new{T, N, M, S, A}(D, spatsize)
+    end
+end
+Circulant(A::Circulant) = A
+
+function Adapt.adapt_structure(to, A::Circulant{T, N, M}) where {T, N, M}
+    data = Adapt.adapt_structure(to, A.data)
+    Circulant(data, M, A.spatial_size)
+end
+
+CUDA.unsafe_free!(A::Circulant) = CUDA.unsafe_free!(A.data)
+
+circulant(M::Int, x::AnyCuArray{T, N}) where {T,N} = Circulant{real(T)}(M, (size(x)[1:N-2]..., 1, size(x,N)))
+
+kernel_length(A::Circulant{T, N, M}) where {T, N, M} = M
+spatial_dims(A::Circulant{T, N, M, S}) where {T, N, M, S} = S
+spatial_size(A::Circulant) = A.spatial_size
+
+Base.eltype(A::Circulant{T}) where T = T
+Base.size(A::Circulant) = size(A.data)
+Base.size(A::Circulant, i::Int) = size(A.data, i)
+Base.ndims(A::Circulant) = ndims(A.data)
+Base.getindex(A::Circulant, idxs...) = Base.getindex(A.data, idxs...)
+
+Base.similar(A::Circulant{T, N, M}) where {T, N, M} = Circulant(similar(A.data), M, spatial_size(A))
+Base.copy(A::Circulant{T, N, M}) where {T, N, M} = Circulant(copy(A.data), M, spatial_size(A))
+
+function Base.show(io::IOContext, m::MIME"text/plain", A::Circulant{T, N, M}) where {T, N, M}
+    print(io, typeof(A), " with kernel-length $M, spatial-size $(spatial_size(A)), and data,\n")
+    show(io, m, A.data)
+end
+
+function Base.repeat(A::Circulant{T, N, M}, dims::Int...) where {T, N, M}
+    data = repeat(A.data, dims...)
+    Circulant(data, M, spatial_size(A))
+end
+
+function Base.reshape(A::Circulant{T, N, M}, dims::Union{Colon,Int}...) where {T, N, M}
+    Circulant(reshape(A.data, dims...), M, spatial_size(A))
+end
+
+function Base.cat(As::Circulant{T, N, M}...; dims=3) where {T, N, M}
+    Circulant(cat([A.data for A in As]...; dims=dims), M, spatial_size(A))
+end
+
+function Base.:(+)(A::Circulant{T, N, M, S}, B::Circulant{T, N, M, S}) where {T, N, M, S<:CuSparseArrayCSR}
+    data = CuSparseArrayCSR(copy(A.data.rowPtr), copy(A.data.colVal), A.data.nzVal + B.data.nzVal, size(A))
+    Circulant(data, M, spatial_size(A))
+end
+
+function Base.:(-)(A::Circulant{T, N, M, S}, B::Circulant{T, N, M, S}) where {T, N, M, S<:CuSparseArrayCSR}
+    data = CuSparseArrayCSR(copy(A.data.rowPtr), copy(A.data.colVal), A.data.nzVal - B.data.nzVal, size(A))
+    Circulant(data, M, spatial_size(A))
+end
+
+function Base.:(*)(c::Number, A::Circulant{T, N, M, S}) where {T, N, M, S <: CuSparseArrayCSR}
+    data = CuSparseArrayCSR(copy(A.data.rowPtr), copy(A.data.colVal), c .* A.data.nzVal, size(A))
+    Circulant(data, M, spatial_size(A))
+end
+Base.:(-)(A::Circulant) = -1*A
+Base.:(*)(A::Circulant, c::Number) = c*A
+
+function sumdim1(A::CuSparseArrayCSR{T}) where T
+    o = CUDA.ones(T, (size(A,1), 2, prod(size(A)[3:end])))
+    # second dim is 2 bc n==1 causes errors
+    s =  batched_transpose(reshape(A, :, :, :)) ⊠ o
+    reshape(s[:,1,:], (1, size(A, 1), size(A)[3:end]...))
+end
+
+function sumdim2(A::CuSparseArrayCSR)
+    V = reshape(A.nzVal, :, size(A, 1), size(A)[3:end]...)
+    s = sum(V; dims=1)
+    return reshape(s, size(A,1), 1, size(A)[3:end]...)
+end
+
+function Base.sum(A::CuSparseArrayCSR; dims=:)
+    if dims == 1
+        return sumdim1(A)
+    elseif dims == 2
+        return sumdim2(A)
+    elseif dims == Colon()
+        return sum(A.nzVal)
+    else
+        throw(ErrorException("dims=$dims not implemented."))
+    end
+end
+
+Base.sum(A::Circulant; kws...) = sum(A.data; kws...)

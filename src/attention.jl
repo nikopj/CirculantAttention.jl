@@ -37,3 +37,12 @@ end
 circulant_attention(A::Circulant, x) = circulant_attention!(similar(x), A, x)
 
 const ⊗ = circulant_attention
+
+function circulant_mh_attention(A::Circulant{Ta, 4}, x::AbstractArray{T, N}) where {Ta, T, N}
+    nheads = size(A, 3)
+    xr = splitheads(x, nheads)
+    yr = A ⊗ xr
+    return reshape(yr, size(x)...)
+end
+
+const ⨷ = circulant_mh_attention

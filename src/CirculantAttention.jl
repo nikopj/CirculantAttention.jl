@@ -21,7 +21,7 @@ export circulant_adjacency, circulant_adjacency!
 # export convex_comb
 
 include("attention.jl")
-export circulant_attention, circulant_mh_attention, circulant_mh_adjacency, ⊗
+export circulant_attention, circulant_mh_attention, circulant_mh_adjacency, ⊗, ⨷
 
 include("batchedmul.jl")
 

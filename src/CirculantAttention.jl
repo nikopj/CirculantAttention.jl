@@ -8,6 +8,7 @@ using LinearAlgebra
 
 using NNlib
 import ChainRulesCore as CRC
+import Zygote
 
 include("array.jl")
 include("circulant.jl")
@@ -23,5 +24,6 @@ export circulant_attention, circulant_mh_attention, circulant_mh_adjacency, ⊗,
 include("batchedmul.jl")
 
 include("rrules.jl")
+include("zygote.jl")
 
 end

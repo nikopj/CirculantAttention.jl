@@ -1,18 +1,19 @@
 struct Circulant{T, N, M, S, A<:AbstractArray{T, N}} <: AbstractArray{T, N}
     data::A
+    kernel_length::Int
     spatial_size::NTuple{S, Int}
 
-    function Circulant(M::Int, dims::NTuple{N,Int}) where N
-        Circulant{Float32}(M, dims)
-    end
     function Circulant{T}(M::Int, dims::NTuple{N,Int}) where {T,N}
         spatsize, batchsize = dims[1:N-2], dims[N-1:end]
         data = cucirculant(M, spatsize..., T)
         data = repeat(data, 1, 1, batchsize...)
         Circulant(data, M, spatsize)
     end
+    function Circulant(M::Int, dims::NTuple{N,Int}) where N
+        Circulant{Float32}(M, dims)
+    end
     function Circulant(D::A, M::Int, spatsize::NTuple{S,Int}) where {T, N, S, A<:AbstractArray{T,N}}
-        new{T, N, M, S, A}(D, spatsize)
+        new{T, N, M, S, A}(D, M, spatsize)
     end
 end
 Circulant(A::Circulant) = A
@@ -51,6 +52,10 @@ end
 
 function Base.reshape(A::Circulant{T, N, M}, dims::Union{Colon,Int}...) where {T, N, M}
     Circulant(reshape(A.data, dims...), M, spatial_size(A))
+end
+
+function _circulant_reshape(A::Circulant{T, N, M}, dims...) where {T, N, M}
+    reshape(A, dims...)
 end
 
 function Base.cat(As::Circulant{T, N, M}...; dims=3) where {T, N, M}
@@ -134,5 +139,17 @@ function Base.sum(A::CuSparseArrayCSR; dims=:)
         throw(ErrorException("dims=$dims not implemented."))
     end
 end
+Base.sum(A::Circulant; dims=:) = sum(A.data; dims=dims)
 
-Base.sum(A::Circulant; kws...) = sum(A.data; kws...)
+function scale(c::CuArray{Tc,N}, A::CuSparseArrayCSR{Ta,Ti,N}) where {Tc, Ta, Ti, N}
+    @assert size(c, 1) == 1 && size(c, 2) == 1 "Scaling of non-batchdims of CuSparseArrayCSR not implemented"
+    nzVal = selectdim(c, 1, 1) .* A.nzVal
+    rowPtr = repeat(A.rowPtr, 1, ntuple(i->size(nzVal,i+1) ÷ size(A.rowPtr,i+1),N-2)...)
+    colVal = repeat(A.colVal, 1, ntuple(i->size(nzVal,i+1) ÷ size(A.colVal,i+1),N-2)...)
+    return CuSparseArrayCSR(rowPtr, colVal, nzVal, (size(A,1), size(A,2), size(nzVal)[2:end]...))
+end
+scale(c::CuArray{T1,N}, A::Circulant{T2,N,M}) where {T1,T2,N,M} = Circulant(scale(c, A.data), M, spatial_size(A))
+scale(c, A) = c .* A
+
+Base.:(*)(c::CuArray, A::Circulant) = scale(c, A)
+

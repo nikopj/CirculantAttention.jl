@@ -24,7 +24,8 @@ splitheads(x::AbstractArray{T,N}, nheads) where {T,N} = reshape(x, ntuple(i->siz
 function circulant_mh_adjacency(simfun, x::AbstractArray{T,N}, y, W::Integer, nheads::Int) where {T, N}
     xr, yr = splitheads.((x, y), nheads)
     A = circulant_adjacency(simfun, xr, yr, W)
-    return reshape(A, :, :, nheads, size(x, N))
+    # return reshape(A, :, :, nheads, size(x, N))
+    return _circulant_reshape(A, :, :, nheads, size(x, N))
 end
 
 function circulant_attention!(y::AbstractArray{T, N}, A::Circulant{Ta, Na}, x::AbstractArray{T, N}) where {Ta, Na, T, N}

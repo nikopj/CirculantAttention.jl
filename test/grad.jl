@@ -1,5 +1,6 @@
 using Zygote
 using NNlib
+using LinearAlgebra
 
 @testset "grad" begin
     nheads = 2
@@ -15,7 +16,7 @@ using NNlib
         # (100, 100, 1, 2)
         A = circulant_adjacency(simfun, k, q, windowsize) 
         B = circulant_adjacency(simfun, xx, xx, windowsize) 
-        C = α*A + (1f0-α)*B
+        C = α*A + (1f0 .- α)*B
 
         z = C ⊗ v             # (10, 10, 8, 2)
         z = NNlib.conv(z, wz) # (8, 8, 4, 2)
@@ -32,14 +33,14 @@ using NNlib
         # (100, 100, nheads, 2)
         A = circulant_mh_adjacency(simfun, k, q, windowsize, nheads) 
         B = circulant_mh_adjacency(simfun, xx, xx, windowsize, nheads) 
-        C = α*A + (1f0-α)*B
+        C = α*A + (1f0 .- α)*B
 
         z = C ⨷ v             # (10, 10, 8, 2)
         z = NNlib.conv(z, wz) # (8, 8, 4, 2)
         return z
     end
 
-    @testset "nspatdims=$N" for N=1:2
+    @testset "nspatdims=$N" for N=(1,2)
         @testset "simfun=$simfun" for simfun=(DotSimilarity(), DistanceSimilarity())
             x = CUDA.randn(ntuple(_->12,N)..., 4, 2)
             y = CUDA.randn(ntuple(_->8,N)..., 4, 2)
@@ -49,9 +50,11 @@ using NNlib
             Wq = CUDA.randn(ks..., 4, 8)
             Wv = CUDA.randn(ks..., 4, 8)
             Wz = CUDA.randn(ks..., 8, 4)
-            ps = (Wx, Wk, Wq, Wv, Wz, 0.5f0)
 
             @testset "attention" begin
+                α = 0.8f0 * CUDA.ones(1,1,1,1)
+                ps = (Wx, Wk, Wq, Wv, Wz, α)
+
                 z = dnn(x, ps, simfun)
                 @test size(z) == (ntuple(_->8,N)..., 4, 2)
 
@@ -64,6 +67,9 @@ using NNlib
             end
 
             @testset "multhead attention" begin
+                α = 0.8f0 * CUDA.ones(1,1,nheads,1)
+                ps = (Wx, Wk, Wq, Wv, Wz, α)
+
                 z = dnn_mh(x, ps, simfun)
                 @test size(z) == (ntuple(_->8,N)..., 4, 2)
 
@@ -74,6 +80,48 @@ using NNlib
 
                 @test !any(isnothing.(gs))
             end
+
+            @testset "circulant" begin
+                α = 0.8f0 * CUDA.ones(1,1,nheads,1)
+                z1 = CUDA.randn(ntuple(_->12,N)..., 4, 2)
+                z2 = CUDA.randn(ntuple(_->12,N)..., 4, 2)
+                A = circulant_mh_adjacency(simfun, z1, z2, windowsize, nheads)
+                B = circulant_mh_adjacency(simfun, z1, z1, windowsize, nheads)
+
+                @testset "combination" begin
+                    val, gs = withgradient((α,)) do (θ,)
+                        C = θ*A + 2θ*B
+                        sum(C)
+                    end
+
+                    @test !any(isnothing.(gs))
+                end
+
+                @testset "adjacencny" begin
+                    val, gs = withgradient((Wx, α,)) do (wx, θ,)
+                        x = NNlib.conv(z1, wx)
+                        y = NNlib.conv(z2, wx)
+                        A = circulant_adjacency(simfun, x, y, windowsize)
+                        z = A ⊗ x
+                        sum(z)
+                    end
+
+                    @test !any(isnothing.(gs))
+                end
+
+                @testset "mh adjacencny" begin
+                    val, gs = withgradient((Wx, α,)) do (wx, θ,)
+                        x = NNlib.conv(z1, wx)
+                        y = NNlib.conv(z2, wx)
+                        A = circulant_mh_adjacency(simfun, x, y, windowsize, nheads)
+                        z = A ⨷ x
+                        sum(z)
+                    end
+
+                    @test !any(isnothing.(gs))
+                end
+            end
+
         end
     end
 end

@@ -17,6 +17,7 @@ struct Circulant{T, N, M, S, A<:AbstractArray{T, N}} <: AbstractArray{T, N}
     end
 end
 Circulant(A::Circulant) = A
+Circulant(a::T, M, spatdims) where T <: Number = a
 
 function Adapt.adapt_structure(to, A::Circulant{T, N, M}) where {T, N, M}
     data = Adapt.adapt_structure(to, A.data)
@@ -128,6 +129,30 @@ function sumdim2(A::CuSparseArrayCSR)
     return reshape(s, size(A,1), 1, size(A)[3:end]...)
 end
 
+function sumdim3(A::CuSparseArrayCSR, i::Int)
+    @assert i > 2 "sumdim3 can only sum batch dimensions of a CSR"
+    nzVal = sum(A.nzVal; dims=i-1)
+    rowPtr = selectdim(A.rowPtr, i-1, 1:1) |> copy
+    colVal = selectdim(A.colVal, i-1, 1:1) |> copy
+    dims = ntuple(d -> d == i ? 1 : size(A,d), ndims(A))
+    return CuSparseArrayCSR(rowPtr, colVal, nzVal, dims)
+end
+
+function sumdim3(A::CuSparseArrayCSR, dims::Int...)
+    @assert all(dims .> 2) "sumdim3 can only sum batch dimensions of a CSR"
+    nzVal = sum(A.nzVal; dims = dims .- 1)
+    idx = ntuple(i->i + 1 ∈ dims ? (1:1) : Colon(), ndims(A)-1)
+    rowPtr = getindex(A.rowPtr, idx...) |> copy
+    colVal = getindex(A.colVal, idx...) |> copy
+    dims = ntuple(i -> i ∈ dims ? 1 : size(A,i), ndims(A))
+    return CuSparseArrayCSR(rowPtr, colVal, nzVal, dims)
+end
+
+function sumdim12(A::CuSparseArrayCSR)
+    s = sum(A.nzVal; dims=1)
+    return reshape(s, 1, size(s)...)
+end
+
 function Base.sum(A::CuSparseArrayCSR; dims=:)
     if dims == 1
         return sumdim1(A)
@@ -135,11 +160,21 @@ function Base.sum(A::CuSparseArrayCSR; dims=:)
         return sumdim2(A)
     elseif dims == Colon()
         return sum(A.nzVal)
+    elseif all(dims .> 2)
+        return sumdim3(A, dims...)
+    elseif dims == (1,2)
+        return sumdim12(A)
     else
         throw(ErrorException("dims=$dims not implemented."))
     end
 end
-Base.sum(A::Circulant; dims=:) = sum(A.data; dims=dims)
+
+function Base.sum(A::Circulant; dims=:)
+    if dims != Colon() && all(dims .> 2)
+        return Circulant(sum(A.data; dims=dims), kernel_length(A), spatial_size(A))
+    end
+    return sum(A.data; dims=dims)
+end
 
 function scale(c::CuArray{Tc,N}, A::CuSparseArrayCSR{Ta,Ti,N}) where {Tc, Ta, Ti, N}
     @assert size(c, 1) == 1 && size(c, 2) == 1 "Scaling of non-batchdims of CuSparseArrayCSR not implemented"

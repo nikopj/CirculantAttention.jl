@@ -70,7 +70,7 @@ function circulant_similarity_kernel!(
         Ci, Cj = C[i], C[j]
         s = zero(Tv)
         for m=1:size(x, N-1)
-            s += x[Cj, m, b]*y[Ci, m, b]
+            s += real(x[Cj, m, b]*conj(y[Ci, m, b]))
         end
         S.data.nzVal[n, b] = s
     end

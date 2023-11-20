@@ -34,11 +34,48 @@ function NNlib.batched_mul!(C::BatchedCuDense, A::NNlib.BatchedAdjoint{T, <:Circ
     NNlib.batched_mul!(C, NNlib.batched_adjoint(A.parent.data), B)
 end
 
-
 function NNlib.batched_mul(A::BatchedCuSparse{TA}, B::BatchedCuDense{TB}) where {TA, TB}
-    C = similar(B, promote_type(TA, TB), 
-                (size(A, 1), size(B, 2), [max(size(A, i), size(B, i)) for i=3:max(ndims(A), ndims(B))]...))
+    C = similar(B, promote_type(TA, TB), (size(A, 1), size(B, 2), [max(size(A, i), size(B, i)) for i=3:max(ndims(A), ndims(B))]...))
     NNlib.batched_mul!(C, A, B)
+    return C
+end
+
+function Base.real(A::CuSparseArrayCSR{Tv,Ti,N}) where {Tv<:Complex, Ti, N}
+    return CuSparseArrayCSR{real(Tv), Ti, N}(copy(A.rowPtr), copy(A.colVal), real(A.nzVal), A.dims)
+end
+
+function Base.real(A::CuSparseArrayCSR{Tv}) where Tv<:Real
+    return A
+end
+
+function Base.complex(A::CuSparseArrayCSR{Tv,Ti,N}) where {Tv<:Real, Ti, N}
+    return CuSparseArrayCSR{complex(Tv), Ti, N}(copy(A.rowPtr), copy(A.colVal), complex(A.nzVal), A.dims)
+end
+
+function Base.complex(A::CuSparseArrayCSR{Tv}) where Tv<:Complex
+    return A
+end
+
+function Base.complex(A::NNlib.BatchedTranspose{<:Complex, <:CUSPARSE.CuSparseArrayCSR})
+    return A
+end
+function Base.complex(A::NNlib.BatchedTranspose{<:Real, <:CUSPARSE.CuSparseArrayCSR})
+    return batched_transpose(complex(A.parent))
+end
+function Base.complex(A::NNlib.BatchedAdjoint{<:Complex, <:CUSPARSE.CuSparseArrayCSR})
+    return A
+end
+function Base.complex(A::NNlib.BatchedAdjoint{<:Real, <:CUSPARSE.CuSparseArrayCSR})
+    return batched_adjoint(complex(A.parent))
+end
+
+function NNlib.batched_mul!(C::BatchedCuDense{<:Complex}, A::BatchedCuSparse{<:Real}, B::BatchedCuDense{<:Complex})
+    NNlib.batched_mul!(C, complex(A), B)
+    return C
+end
+
+function NNlib.batched_mul!(C::BatchedCuDense{<:Complex}, A::BatchedCuSparse{<:Complex}, B::BatchedCuDense{<:Real})
+    NNlib.batched_mul!(C, A, complex(B))
     return C
 end
 

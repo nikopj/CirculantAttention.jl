@@ -28,3 +28,20 @@ function FD.to_vec(A::Circulant{T, N, M}) where {T,N,M}
     end
     return x_vec, Circulant_from_vec
 end
+
+function FD.to_vec(A::CuArray{ComplexF32}) 
+    xr, xi = reim(A)
+    xr_vec, rback = FD.to_vec(xr)
+    xi_vec, iback = FD.to_vec(xi)
+    x_vec = [xr_vec; xi_vec]
+    function complex_from_vec(x_v)
+        N = length(x_v) ÷ 2
+        xr_vec = x_v[1:N]
+        xi_vec = x_v[N+1:end]
+        xr = rback(xr_vec)
+        xi = iback(xi_vec)
+        x = xr +  1im .* xi
+        return x
+    end
+    return x_vec, complex_from_vec
+end

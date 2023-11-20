@@ -40,88 +40,89 @@ using LinearAlgebra
         return z
     end
 
-    @testset "nspatdims=$N" for N=(1,2)
-        @testset "simfun=$simfun" for simfun=(DotSimilarity(), DistanceSimilarity())
-            x = CUDA.randn(ntuple(_->12,N)..., 4, 2)
-            y = CUDA.randn(ntuple(_->8,N)..., 4, 2)
-            ks = ntuple(_->3,N)
-            Wx = CUDA.randn(ks..., 4, 8)
-            Wk = CUDA.randn(ks..., 4, 8)
-            Wq = CUDA.randn(ks..., 4, 8)
-            Wv = CUDA.randn(ks..., 4, 8)
-            Wz = CUDA.randn(ks..., 8, 4)
+    @testset "$elty" for elty=(Float32, ComplexF32)
+        @testset "nspatdims=$N" for N=(1,2)
+            @testset "simfun=$simfun" for simfun=(DotSimilarity(), DistanceSimilarity())
+                x = CUDA.randn(elty, ntuple(_->12,N)..., 4, 2)
+                y = CUDA.randn(elty, ntuple(_->8,N)..., 4, 2)
+                ks = ntuple(_->3,N)
+                Wx = CUDA.randn(elty, ks..., 4, 8)
+                Wk = CUDA.randn(elty, ks..., 4, 8)
+                Wq = CUDA.randn(elty, ks..., 4, 8)
+                Wv = CUDA.randn(elty, ks..., 4, 8)
+                Wz = CUDA.randn(elty, ks..., 8, 4)
 
-            @testset "attention" begin
-                α = 0.8f0 * CUDA.ones(1,1,1,1)
-                ps = (Wx, Wk, Wq, Wv, Wz, α)
+                @testset "attention" begin
+                    α = 0.8f0 * CUDA.ones(1,1,1,1)
+                    ps = (Wx, Wk, Wq, Wv, Wz, α)
 
-                z = dnn(x, ps, simfun)
-                @test size(z) == (ntuple(_->8,N)..., 4, 2)
+                    z = dnn(x, ps, simfun)
+                    @test size(z) == (ntuple(_->8,N)..., 4, 2)
 
-                val, gs = withgradient(ps) do Θ
-                    z = dnn(x, Θ, simfun)
-                    sum(abs2, y - z) / length(y)
-                end
-
-                @test !any(isnothing.(gs))
-            end
-
-            @testset "multhead attention" begin
-                α = 0.8f0 * CUDA.ones(1,1,nheads,1)
-                ps = (Wx, Wk, Wq, Wv, Wz, α)
-
-                z = dnn_mh(x, ps, simfun)
-                @test size(z) == (ntuple(_->8,N)..., 4, 2)
-
-                val, gs = withgradient(ps) do Θ
-                    z = dnn_mh(x, Θ, simfun)
-                    sum(abs2, y - z) / length(y)
-                end
-
-                @test !any(isnothing.(gs))
-            end
-
-            @testset "circulant" begin
-                α = 0.8f0 * CUDA.ones(1,1,nheads,1)
-                z1 = CUDA.randn(ntuple(_->12,N)..., 4, 2)
-                z2 = CUDA.randn(ntuple(_->12,N)..., 4, 2)
-                A = circulant_mh_adjacency(simfun, z1, z2, windowsize, nheads)
-                B = circulant_mh_adjacency(simfun, z1, z1, windowsize, nheads)
-
-                @testset "combination" begin
-                    val, gs = withgradient((α,)) do (θ,)
-                        C = θ*A + 2θ*B
-                        sum(C)
+                    val, gs = withgradient(ps) do Θ
+                        z = dnn(x, Θ, simfun)
+                        sum(abs2, y - z) / length(y)
                     end
 
                     @test !any(isnothing.(gs))
                 end
 
-                @testset "adjacencny" begin
-                    val, gs = withgradient((Wx, α,)) do (wx, θ,)
-                        x = NNlib.conv(z1, wx)
-                        y = NNlib.conv(z2, wx)
-                        A = circulant_adjacency(simfun, x, y, windowsize)
-                        z = A ⊗ x
-                        sum(z)
+                @testset "multhead attention" begin
+                    α = 0.8f0 * CUDA.ones(1,1,nheads,1)
+                    ps = (Wx, Wk, Wq, Wv, Wz, α)
+
+                    z = dnn_mh(x, ps, simfun)
+                    @test size(z) == (ntuple(_->8,N)..., 4, 2)
+
+                    val, gs = withgradient(ps) do Θ
+                        z = dnn_mh(x, Θ, simfun)
+                        sum(abs2, y - z) / length(y)
                     end
 
                     @test !any(isnothing.(gs))
                 end
 
-                @testset "mh adjacencny" begin
-                    val, gs = withgradient((Wx, α,)) do (wx, θ,)
-                        x = NNlib.conv(z1, wx)
-                        y = NNlib.conv(z2, wx)
-                        A = circulant_mh_adjacency(simfun, x, y, windowsize, nheads)
-                        z = A ⨷ x
-                        sum(z)
+                @testset "circulant" begin
+                    α = 0.8f0 * CUDA.ones(1,1,nheads,1)
+                    z1 = CUDA.randn(elty, ntuple(_->12,N)..., 4, 2)
+                    z2 = CUDA.randn(elty, ntuple(_->12,N)..., 4, 2)
+                    A = circulant_mh_adjacency(simfun, z1, z2, windowsize, nheads)
+                    B = circulant_mh_adjacency(simfun, z1, z1, windowsize, nheads)
+
+                    @testset "combination" begin
+                        val, gs = withgradient((α,)) do (θ,)
+                            C = θ*A + 2θ*B
+                            sum(C)
+                        end
+
+                        @test !any(isnothing.(gs))
                     end
 
-                    @test !any(isnothing.(gs))
+                    @testset "adjacencny" begin
+                        val, gs = withgradient((Wx, α,)) do (wx, θ,)
+                            x = NNlib.conv(z1, wx)
+                            y = NNlib.conv(z2, wx)
+                            A = circulant_adjacency(simfun, x, y, windowsize)
+                            z = A ⊗ x
+                            sum(abs2, z)
+                        end
+
+                        @test !any(isnothing.(gs))
+                    end
+
+                    @testset "mh adjacencny" begin
+                        val, gs = withgradient((Wx, α,)) do (wx, θ,)
+                            x = NNlib.conv(z1, wx)
+                            y = NNlib.conv(z2, wx)
+                            A = circulant_mh_adjacency(simfun, x, y, windowsize, nheads)
+                            z = A ⨷ x
+                            sum(abs2, z)
+                        end
+
+                        @test !any(isnothing.(gs))
+                    end
                 end
             end
-
         end
     end
 end

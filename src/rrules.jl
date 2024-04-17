@@ -71,6 +71,22 @@ function CRC.rrule(::typeof(circulant_attention), A::Circulant{T, N, M}, b::Abst
     return A ⊗ b, circulant_attention_pullback
 end
 
+function CRC.rrule(::typeof(circulant_transposed_attention), A::Circulant{T, N, M}, b::AbstractArray{Tb,Nb}) where {T, N, M, Tb, Nb}
+    project_A = CRC.ProjectTo(A)
+    project_b = CRC.ProjectTo(b)
+    function circulant_transposed_attention_pullback(dc)
+        Δc = CRC.unthunk(dc)
+        ∂A = CRC.@thunk project_A(reshape(circulant_similarity(DotSimilarity(), b, Δc, M), size(A)...))
+        ∂b = CRC.@thunk begin
+            ΔC = reshape(Δc, :, size(Δc)[Nb-1:end]...)
+            ∂B = reshape(A, :,:,:) ⊠ ΔC
+            project_b(reshape(∂B, size(b)...))
+        end
+        return (CRC.NoTangent(), ∂A, ∂b)
+    end
+    return circulant_transposed_attention(A, b), circulant_transposed_attention_pullback
+end
+
 function LinearAlgebra.dot(f::Zygote.FillArrays.Fill{T,N}, A::Circulant{T,N}) where {T,N}
     return f.value * sum(A)
 end

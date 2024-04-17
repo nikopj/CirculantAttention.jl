@@ -39,6 +39,16 @@ circulant_attention(A::Circulant, x) = circulant_attention!(similar(x), A, x)
 
 const ⊗ = circulant_attention
 
+function circulant_transposed_attention!(y::AbstractArray{T, N}, A::Circulant{Ta, Na}, x::AbstractArray{T, N}) where {Ta, Na, T, N}
+    @assert spatial_dims(A) == N - 2 "spatial-dims ($(spatial_dims(A)) of A must match spatial dims of x ($(N-2))"
+    X = reshape(x, :, size(x)[N-1:end]...)
+    Y = reshape(y, :, size(y)[N-1:end]...)
+    At = NNlib.batched_transpose(reshape(A, :, :, :))
+    NNlib.batched_mul!(Y, At, X)
+    return y
+end
+circulant_transposed_attention(A::Circulant, x) = circulant_transposed_attention!(similar(x), A, x)
+
 function circulant_mh_attention(A::Circulant{Ta, 4}, x::AbstractArray{T, N}) where {Ta, T, N}
     nheads = size(A, 3)
     xr = splitheads(x, nheads)
@@ -47,3 +57,10 @@ function circulant_mh_attention(A::Circulant{Ta, 4}, x::AbstractArray{T, N}) whe
 end
 
 const ⨷ = circulant_mh_attention
+
+function circulant_mh_transposed_attention(A::Circulant{Ta, 4}, x::AbstractArray{T, N}) where {Ta, T, N}
+    nheads = size(A, 3)
+    xr = splitheads(x, nheads)
+    yr = circulant_transposed_attention(A, xr)
+    return reshape(yr, size(x)...)
+end

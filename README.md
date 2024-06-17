@@ -7,10 +7,10 @@
 Circulant-Sparse Attention (CircAtt) performs Query-Key-Value scaled attention with a sliding-window mask,
 
 $$
-Y = sm(M \circ QK^T / sqrt(\tau))V,
+Y = \mathrm{rowsoftmax}(M \circ QK^T / sqrt(\tau))V,
 $$
 
-where $M$ is a mask with a circulant sparsity pattern or block-circulant with
+where $\tau$ is the number of channels and $M$ is a mask with a circulant sparsity pattern or block-circulant with
 circulant blocks (BCCB) sparsity pattern for 1D and 2D signals, respectively.
 This sparsity pattern is the result of only computing similarities between $q$
 and $k$ in a sliding window with circular boundary extensions.
@@ -108,7 +108,7 @@ Circulant{Float32, 4, 15, 2, CUDA.CUSPARSE.CuSparseArrayCSR{Float32, Int32, 4}} 
 ```julia
 B = NNlib.softmax(S)
 u = B ⊗ v # \otimes, equivalent to u = circulant_attention(A, v)
-u ≈ y 
+u ≈ y     # true
 ```
 
 We can additionally perform multi-head attention,

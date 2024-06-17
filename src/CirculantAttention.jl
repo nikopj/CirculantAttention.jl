@@ -1,5 +1,8 @@
 module CirculantAttention
 
+const CircAtt = CirculantAttention
+export CircAtt
+
 using CUDA, CUDA.CUSPARSE, cuDNN
 import Adapt
 
@@ -19,7 +22,7 @@ export circulant_similarity, circulant_similarity!, DotSimilarity, DistanceSimil
 export circulant_adjacency, circulant_adjacency!
 
 include("attention.jl")
-export circulant_attention, circulant_mh_attention, circulant_mh_adjacency, ⊗, ⨷
+export circulant_attention, circulant_mh_attention, circulant_mh_adjacency, ⊗, ⨷ # \otimes and \Otimes
 
 include("batchedmul.jl")
 

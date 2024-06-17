@@ -1,6 +1,31 @@
 abstract type AbstractSimilarity end
 
+@doc raw"""
+    DotSimilarity()
+
+Used in `circulant_attention`, `circulant_similarity`, and `circulant_adjacency` to indicate use of
+dot-product similarity:
+
+``
+    S_{ij} = \mathrm{Real}(q[i]^H k[j]).
+``
+
+See also [`DistanceSimilarity`](@ref).
+"""
 struct DotSimilarity <: AbstractSimilarity end 
+
+@doc raw"""
+    DistanceSimilarity()
+
+Used in `circulant_attention`, `circulant_similarity`, and `circulant_adjacency` to indicate use of
+distance similarity:
+
+``
+    S_{ij} = \frac{1}{2}\mathrm{sum}(\mathrm{abs2}, q[i] - k[j]).
+``
+
+See also [`DotSimilarity`](@ref).
+"""
 struct DistanceSimilarity <: AbstractSimilarity end
 
 function circulant_similarity!(A::Circulant{T, N}, simfun, x, y) where {T, N}
@@ -90,11 +115,26 @@ function NNlib.softmax!(A::Circulant{T,N,M}, B::Circulant{T,N,M}=A) where {T,N,M
     return A
 end
 
+"""
+    NNlib.softmax(A::Circulant)
+
+Row-wise softmax of Circulant matrix `A`. 
+"""
 function NNlib.softmax(A::Circulant) 
     data = circulant_softmax(A.data)
     return Circulant(data, kernel_length(A), spatial_size(A))
 end
 
+"""
+    circulant_similarity(simfun::AbstractSimilarity, x, y, W::Int)
+
+Returns Circulant matrix with circulant-sparse data. Each non-zero `S[i,j,b]` is 
+populated by `simfun` evaluated at the linearized pixel locations of `x` and `y`, 
+i.e. `S[i,j,b] = simfun(x[...,i,b], y[...,j,b], W)` for max(i⃗, j⃗) ≤ W. The non-zero entrie 
+locations are determined by the windowsize `W` and number of spatial dimensions in `x` and `y`.
+
+See also [`DotSimilarity`](@ref), [`DistanceSimilarity`](@ref).
+"""
 function circulant_similarity(simfun::AbstractSimilarity, x::AbstractArray{T,N}, y::AbstractArray{T,N}, W::Integer)::Circulant where {T,N}
     S = Circulant(W, (size(x)[1:N-2]..., 1, size(x, N)))
     circulant_similarity!(S, simfun, x, y)
@@ -107,6 +147,13 @@ function circulant_adjacency!(A::Circulant, simfun, x, y)
     return A
 end
 
+"""
+    circulant_adjacency(simfun::AbstractSimilarity, x, y, W::Int)
+
+Equivalent to `(softmax ∘ circulant_similarity)(simfun, x, y, W)`.
+
+See also [`circulant_similarity`](@ref), [`NNlib.softmax`](@ref).
+"""
 function circulant_adjacency(simfun::AbstractSimilarity, x, y, W::Integer)
     A = circulant_similarity(simfun, x, y, W)
     B = NNlib.softmax(A)

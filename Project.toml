@@ -11,13 +11,20 @@ ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
-StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [compat]
 julia = "1.9, 1.10"
+Adapt = "4"
 CUDA = "5.3, 5.4"
+ChainRules = "1.69"
+ChainRulesCore = "1.20"
+LinearAlgebra = "1"
+NNlib = "1"
+SparseArrays = "1"
+Zygote = "0.6"
+cuDNN = "1"
 
 [extras]
 ChainRulesTestUtils = "cdddcdb0-9152-4a09-a978-84456f9df70a"

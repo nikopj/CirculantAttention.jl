@@ -1,8 +1,6 @@
 using CirculantAttention
 using Documenter
 
-push!(LOAD_PATH,"../src/") # remove when depolyed
-
 DocMeta.setdocmeta!(CirculantAttention, :DocTestSetup, :(using CirculantAttention); recursive=true)
 
 makedocs(;

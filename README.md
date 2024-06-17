@@ -7,7 +7,7 @@
 Circulant-Sparse Attention (CircAtt) performs Query-Key-Value scaled attention with a sliding-window mask,
 
 $$
-Y = \mathrm{rowsoftmax}(M \circ QK^T / sqrt(\tau))V,
+Y = \mathrm{rowsoftmax}(M \circ QK^T / \mathrm{sqrt}(\tau))V,
 $$
 
 where $\tau$ is the number of channels and $M$ is a mask with a circulant sparsity pattern or block-circulant with

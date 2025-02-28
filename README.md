@@ -30,6 +30,13 @@ CirculantAttention.jl is based on
 [CUDA.jl](https://github.com/JuliaGPU/CUDA.jl)'s CuSparseArrayCSR object, which
 allows multi-dimensional sparse arrays in the compressed-sparse-row format.
 
+See [GroupCDL](https://github.com/nikopj/GroupCDL) for an example usage of CircAtt in deep image denoising.
+Further details are available in the manuscript, [*GroupCDL: Interpretable Denoising and Compressed Sensing
+MRI via Learned Group-Sparsity and Circulant
+Attention*](https://ieeexplore.ieee.org/document/10874214), in IEEE
+Transactions on Computational Imaging 2025 [(preprint
+available)](https://arxiv.org/abs/2407.18967).
+
 ## Quickstart
 ```julia
 using CUDA
@@ -141,3 +148,17 @@ D = cat(A, B; dims=3) # (HW, HW, 2nheads, B)
 ```
 See `src/array.jl` for more details.
 
+## Publications
+If you find this code/work useful, please cite:
+```
+@ARTICLE{janjusevicGroupCDL2025,
+  author={Janjušević, Nikola and Khalilian-Gourtani, Amirhossein and Flinker, Adeen and Feng, Li and Wang, Yao},
+  journal={IEEE Transactions on Computational Imaging}, 
+  title={{GroupCDL}: Interpretable Denoising and Compressed Sensing MRI via Learned Group-Sparsity and Circulant Attention}, 
+  year={2025},
+  volume={11},
+  number={},
+  pages={201-212},
+  doi={10.1109/TCI.2025.3539021}
+}
+```

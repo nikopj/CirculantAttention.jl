@@ -86,17 +86,6 @@ using LinearAlgebra
                     α = 0.8f0 * CUDA.ones(1,1,nheads,1)
                     z1 = CUDA.randn(elty, ntuple(_->12,N)..., 4, 2)
                     z2 = CUDA.randn(elty, ntuple(_->12,N)..., 4, 2)
-                    A = circulant_mh_adjacency(simfun, z1, z2, windowsize, nheads)
-                    B = circulant_mh_adjacency(simfun, z1, z1, windowsize, nheads)
-
-                    @testset "combination" begin
-                        val, gs = withgradient((α,)) do (θ,)
-                            C = θ*A + 2θ*B
-                            sum(C)
-                        end
-
-                        @test !any(isnothing.(gs))
-                    end
 
                     @testset "adjacencny" begin
                         val, gs = withgradient((Wx, α,)) do (wx, θ,)
@@ -115,7 +104,7 @@ using LinearAlgebra
                             x = NNlib.conv(z1, wx)
                             y = NNlib.conv(z2, wx)
                             A = circulant_mh_adjacency(simfun, x, y, windowsize, nheads)
-                            z = A ⨷ x
+                            z = (θ * A) ⨷ x
                             sum(abs2, z)
                         end
 

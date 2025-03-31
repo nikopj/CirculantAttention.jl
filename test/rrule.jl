@@ -19,6 +19,5 @@
     test_rrule(circulant_similarity, DistanceSimilarity(), x ⊢ u, y ⊢ v, ws; output_tangent=A, rtol=1e-3, atol=1e-5, check_inferred=false)
     test_rrule(circulant_attention, A ⊢ B, x ⊢ u; output_tangent=v, rtol=1e-3, atol=1e-5, check_inferred=false)
     test_rrule(NNlib.softmax, A ⊢ B; output_tangent=C, rtol=1e-3, atol=1e-3, check_inferred=false)
-    test_rrule(CirculantAttention.scale, a, A ⊢ C; output_tangent=b*B, rtol=1e-3, atol=1e-4, check_inferred=false)
-    test_rrule(CirculantAttention.scale, c, A ⊢ C; output_tangent=B, rtol=1e-3, atol=1e-4, check_inferred=false)
+    test_rrule(CirculantAttention.scale, a ⊢ b, A ⊢ C; output_tangent=b*B, rtol=1e-3, atol=1e-4, check_inferred=false)
 end

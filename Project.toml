@@ -1,7 +1,7 @@
 name = "CirculantAttention"
 uuid = "84d5bf51-c9fe-456b-b992-3a1345f8cdeb"
 authors = ["nikopj"]
-version = "1.0.1"
+version = "1.0.2"
 
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
@@ -17,14 +17,14 @@ cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [compat]
 Adapt = "4, 5"
-CUDA = "5"
+CUDA = "5.4"
 ChainRules = "1"
 ChainRulesCore = "1"
 LinearAlgebra = "1"
 MLUtils = "0.4"
 NNlib = "0.9"
 SparseArrays = "1"
-Zygote = "0.6, 0.7"
+Zygote = "0.6"
 cuDNN = "1"
 julia = "1.9, 1.10, 1.11"
 

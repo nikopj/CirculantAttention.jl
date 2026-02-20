@@ -14,6 +14,10 @@ See also [`DistanceSimilarity`](@ref).
 """
 struct DotSimilarity <: AbstractSimilarity end 
 
+@inline function simval(::DotSimilarity, xv, yv)
+    real(xv * conj(yv))
+end
+
 @doc raw"""
     DistanceSimilarity()
 
@@ -28,77 +32,72 @@ See also [`DotSimilarity`](@ref).
 """
 struct DistanceSimilarity <: AbstractSimilarity end
 
+@inline function simval(::DistanceSimilarity, xv, yv)
+    - abs2(xv - yv) * 0.5f0
+end
+
 function circulant_similarity!(A::Circulant{T, N}, simfun, x, y) where {T, N}
     circulant_similarity!(reshape(A, :, :, :), simfun, x, y)
     return A
 end
 
 function circulant_similarity!(
-        A::Circulant{Tv, 3, W, S}, 
-        simfun::AbstractSimilarity, 
-        x::AbstractArray{Tx,N}, 
-        y::AbstractArray{Ty,N},
-    ) where {Tv, W, S, Tx, Ty, N}
+    A::Circulant{Tv,3,W,S},
+    simfun::AbstractSimilarity,
+    x::AbstractArray{Tx,N},
+    y::AbstractArray{Ty,N},
+) where {Tv,W,S,Tx,Ty,N}
 
-    @assert S == N - 2 "spatial_dims ($(S)) of circulant matrix must match those of data signal ($(N-2))."
-    @assert size(A, 3) == size(x, N) "batchdim of circulant matrix ($(size(A,3))) must match that of x, y ($(size(x,N)))."
-    maxidx = A.data.nnz 
-    args = A, simfun, x, y, maxidx
+    maxidx   = A.data.nnz
+    nnzb     = A.data.nnz ÷ Int32(size(A,3))
+    M        = Int32(size(x, N-1))
+    spatdims = ntuple(i -> Int32(size(x, i)), N-2)
+    CartInd  = CartesianIndices(spatdims)
+    Wi32 = Int32(W)
+
+    args = (A, simfun, x, y, nnzb, M, spatdims, CartInd, Wi32, maxidx)
     kernel = @cuda launch=false circulant_similarity_kernel!(args...)
-    config = launch_configuration(kernel.fun; max_threads=256)
+    config = launch_configuration(kernel.fun)
     threads = min(maxidx, config.threads)
-    blocks = cld(maxidx, threads)
+    blocks  = cld(maxidx, threads)
+
     kernel(args...; threads=threads, blocks=blocks)
     return A
 end
 
 function circulant_similarity_kernel!(
-        S::Circulant{Tv, 3, W}, 
-        ::DistanceSimilarity, 
-        x::AbstractArray{Tx, N}, 
-        y, 
+        S::Circulant{Tv,3},
+        simfun::AbstractSimilarity,
+        x::AbstractArray{Tx,N},
+        y,
+        nnzb,
+        M,
+        spatdims,
+        CartInd,
+        W,
         maxidx,
-    ) where {Tv, W, Tx, N}
+    ) where {Tv,Tx,N}
 
-    idx = (blockIdx().x-1) * blockDim().x + threadIdx().x
-    @inbounds if idx <= maxidx
-        B = size(S, 3)
-        n, b = CartesianIndices((S.data.nnz ÷ B, B))[idx].I
-        spatdims = ntuple(i->size(x, i), N-2)
-        C = CartesianIndices(spatdims)
+    tid    = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    stride = gridDim().x * blockDim().x
+
+    @inbounds while tid<=maxidx
+        n = (tid - Int32(1)) % nnzb + Int32(1)
+        b = (tid - Int32(1)) ÷ nnzb + Int32(1)
+
+        # spatial indices
         i, j = cartesian_circulant(n, spatdims, W)
-        Ci, Cj = C[i], C[j]
-        s = zero(Tv)
-        for m=1:size(x, N-1)
-            s -= abs2(x[Cj, m, b] - y[Ci, m, b])
-        end
-        S.data.nzVal[n, b] = s / Tv(2)
-    end
-    return nothing
-end
+        Ci, Cj = CartInd[i], CartInd[j]
 
-function circulant_similarity_kernel!(
-        S::Circulant{Tv, 3, W}, 
-        ::DotSimilarity, 
-        x::AbstractArray{Tx,N}, 
-        y, 
-        maxidx,
-    ) where {Tv, W, Tx, N}
-
-    idx = (blockIdx().x-1) * blockDim().x + threadIdx().x
-    @inbounds if idx <= maxidx
-        B = size(S, 3)
-        n, b = CartesianIndices((S.data.nnz ÷ B, B))[idx].I
-        spatdims = ntuple(i->size(x, i), N-2)
-        C = CartesianIndices(spatdims)
-        i, j = cartesian_circulant(n, spatdims, W)
-        Ci, Cj = C[i], C[j]
         s = zero(Tv)
-        for m=1:size(x, N-1)
-            s += real(x[Cj, m, b]*conj(y[Ci, m, b]))
+        for m=Int32(1):M
+            s += simval(simfun, x[Cj, m, b], y[Ci, m, b])
         end
-        S.data.nzVal[n, b] = s
+
+        S.data.nzVal[n, b] = s 
+        tid += stride
     end
+
     return nothing
 end
 

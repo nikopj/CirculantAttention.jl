@@ -1,3 +1,6 @@
+# m: filter index, 
+# s: shift
+# M: filter-length
 @inline circshift_index(m::Ti, s, M) where Ti = mod(m - Ti(1) - s, M) + Ti(1)
 
 @inline function cartesian_circulant(n::Ti, N, M) where Ti
@@ -5,16 +8,14 @@
     p = (M-Ti(1)) >>> Ti(1)
     j = cld(n, M) # col num
     m = mod(n-Ti(1), M) + Ti(1)
-    if j <= p
-        m = circshift_index(m, j - p - Ti(1), M)
-    elseif j > N-p 
-        m = circshift_index(m, p - N + j, M)
-    end
+    # Branchless shift calculation
+    shift = min(Ti(0), j - p - Ti(1)) + max(Ti(0), j - (N - p))
+    m = circshift_index(m, shift, M)
     k = (m - Ti(1)) + (j - Ti(1)) - p
     i = mod(k, N) + Ti(1)
     return i, j
-end
-
+ end
+ 
 @inline function cartesian_circulant(n::Ti, N1, N2, M) where Ti
     # filter size must be odd
     p = (M - Ti(1)) >>> Ti(1)
@@ -25,16 +26,15 @@ end
     nn = mod(cld(n, M) - Ti(1), M) + Ti(1) + M*(jj - Ti(1))  # block num
     mm = mod(nn - Ti(1), M) + Ti(1)                      # block filter coeff num
     m0 = n - M*(mm - Ti(1)) - (j - Ti(1))*Msq            # intra block col filter coeff num
-    if jj <= p
-        mm = circshift_index(mm, jj - p - Ti(1), M)
-    elseif jj > N2-p
-        mm = circshift_index(mm, p - N2 + jj, M)
-    end
-    if j0 <= p
-        m0 = circshift_index(m0, j0 - p - Ti(1), M)
-    elseif j0 > N1-p
-        m0 = circshift_index(m0, p - N1 + j0, M)
-    end
+
+    # Branchless block-level shift
+    shift_mm = min(Ti(0), jj - p - Ti(1)) + max(Ti(0), jj - (N2 - p))
+    mm = circshift_index(mm, shift_mm, M)
+
+    # Branchless intra-block shift
+    shift_m0 = min(Ti(0), j0 - p - Ti(1)) + max(Ti(0), j0 - (N1 - p))
+    m0 = circshift_index(m0, shift_m0, M)
+
     ii = mod((mm - Ti(1)) + (jj - Ti(1)) - p, N2) + Ti(1)              # block row num
     i  = N1*(ii - Ti(1)) + mod((m0 - Ti(1)) + (j0 - Ti(1)) - p, N1) + Ti(1)  # rownum
     return i, j

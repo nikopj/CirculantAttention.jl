@@ -48,9 +48,14 @@ function circulant_similarity!(
     y::AbstractArray{Ty,N},
 ) where {Tv,W,S,Tx,Ty,N}
 
-    maxidx = Int32(A.data.nnz)
+    maxidx   = A.data.nnz
+    nnzb     = A.data.nnz ÷ Int32(size(A,3))
+    M        = Int32(size(x, N-1))
+    spatdims = ntuple(i -> Int32(size(x, i)), N-2)
+    CartInd  = CartesianIndices(spatdims)
+    Wi32 = Int32(W)
 
-    args = (A, simfun, x, y, maxidx)
+    args = (A, simfun, x, y, nnzb, M, spatdims, CartInd, Wi32, maxidx)
     kernel = @cuda launch=false circulant_similarity_kernel!(args...)
     config = launch_configuration(kernel.fun)
     threads = min(maxidx, config.threads)
@@ -61,31 +66,28 @@ function circulant_similarity!(
 end
 
 function circulant_similarity_kernel!(
-        S::Circulant{Tv,3,W},
+        S::Circulant{Tv,3},
         simfun::AbstractSimilarity,
         x::AbstractArray{Tx,N},
         y,
+        nnzb,
+        M,
+        spatdims,
+        CartInd,
+        W,
         maxidx,
-    ) where {Tv,W,Tx,N}
+    ) where {Tv,Tx,N}
 
     tid    = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     stride = gridDim().x * blockDim().x
 
-    nnzb   = S.data.nnz ÷ Int32(size(S,3))      # nnz per batch
-    B      = Int32(size(S,3))
-    M      = Int32(size(x, N-1))
-    spatdims = ntuple(i -> Int32(size(x, i)), N-2)
-    Wi32 = Int32(W)
-
     @inbounds while tid<=maxidx
-        # decode flat index (n, b)
         n = (tid - Int32(1)) % nnzb + Int32(1)
         b = (tid - Int32(1)) ÷ nnzb + Int32(1)
 
         # spatial indices
-        C = CartesianIndices(spatdims)
-        i, j = cartesian_circulant(n, spatdims, Wi32)
-        Ci, Cj = C[i], C[j]
+        i, j = cartesian_circulant(n, spatdims, W)
+        Ci, Cj = CartInd[i], CartInd[j]
 
         s = zero(Tv)
         for m=Int32(1):M

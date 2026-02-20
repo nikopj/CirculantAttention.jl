@@ -51,6 +51,7 @@ end
 results = DataFrame(
     commit = String[],
     date = String[],
+    gpu_name = String[],
     eltype = String[],
     tensorsize = Tuple[],
     windowsize = Int[],
@@ -60,6 +61,7 @@ results = DataFrame(
 
 commit = git_commit()
 date = string(Dates.now())
+dev_name = CUDA.name(CUDA.device())
 
 for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsize in 5:10:45
     for _ in 1:3 # warmup
@@ -69,15 +71,15 @@ for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsiz
 
     # similarity
     t = bench_gpu(() -> circulant_similarity(DistanceSimilarity(), x, y, windowsize))
-    push!(results, (commit, date, string(elty), tensorsize, windowsize, "circulant_similarity", t))
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_similarity", t))
 
     # attention
     t = bench_gpu(() -> circulant_attention(A, x))
-    push!(results, (commit, date, string(elty), tensorsize, windowsize, "circulant_attention", t))
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_attention", t))
 
     # softmax
     t = bench_gpu(() -> NNlib.softmax(A))
-    push!(results, (commit, date, string(elty), tensorsize, windowsize, "softmax", t))
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "softmax", t))
 end
 
 CSV.write("benchmark/benchmark_results.csv", results; append=true)

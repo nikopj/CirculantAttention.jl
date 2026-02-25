@@ -187,4 +187,3 @@ scale(c::CuArray{T1,N}, A::Circulant{T2,N,M}) where {T1,T2,N,M} = Circulant(scal
 scale(c, A) = c .* A
 
 Base.:(*)(c::CuArray, A::Circulant) = scale(c, A)
-

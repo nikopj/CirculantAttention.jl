@@ -1,3 +1,19 @@
+function CRC.rrule(::typeof(circulant_similarity), ::DotSimilarity, x::AbstractArray{T,N}, y::AbstractArray{T,N}, W) where {T,N}
+    project_x = CRC.ProjectTo(x)
+    project_y = CRC.ProjectTo(y)
+    function dot_sim_pullback(dS)
+        d = size(x, N-1)
+        X = reshape(x, prod(size(x)[1:N-2]), d, :)
+        Y = reshape(y, prod(size(y)[1:N-2]), d, :)
+        ΔS  = reshape(CRC.unthunk(dS), :, :, :)
+        ∂x = CRC.@thunk project_x(reshape(ΔS ⊠ Y, size(x)...))
+        ∂y = CRC.@thunk project_y(reshape(batched_transpose(ΔS) ⊠ X, size(y)...))
+        return (CRC.NoTangent(), CRC.NoTangent(), ∂x, ∂y, CRC.NoTangent())
+    end
+    S = circulant_similarity(DotSimilarity(), x, y, W)
+    return S, dot_sim_pullback
+end
+
 function CRC.rrule(::typeof(circulant_similarity), ::DistanceSimilarity, x::AbstractArray{T,N}, y::AbstractArray{T,N}, W) where {T,N}
     project_x = CRC.ProjectTo(x)
     project_y = CRC.ProjectTo(y)
@@ -15,7 +31,7 @@ function CRC.rrule(::typeof(circulant_similarity), ::DistanceSimilarity, x::Abst
     return S, dist_sim_pullback
 end
 
-function CRC.rrule(::typeof(circulant_similarity), ::DotSimilarity, x::AbstractArray{T,N}, y::AbstractArray{T,N}, W) where {T,N}
+function CRC.rrule(::typeof(circulant_similarity), ::PIDotSimilarity, x::AbstractArray{T,N}, y::AbstractArray{T,N}, W) where {T,N}
     project_x = CRC.ProjectTo(x)
     project_y = CRC.ProjectTo(y)
     function dot_sim_pullback(dS)
@@ -23,8 +39,9 @@ function CRC.rrule(::typeof(circulant_similarity), ::DotSimilarity, x::AbstractA
         X = reshape(x, prod(size(x)[1:N-2]), d, :)
         Y = reshape(y, prod(size(y)[1:N-2]), d, :)
         ΔS  = reshape(CRC.unthunk(dS), :, :, :)
-        ∂x = CRC.@thunk project_x(reshape(ΔS ⊠ Y, size(x)...))
-        ∂y = CRC.@thunk project_y(reshape(batched_transpose(ΔS) ⊠ X, size(y)...))
+        ΔZ = sign(ΔS) * ΔS
+        ∂x = CRC.@thunk project_x(reshape(ΔZ ⊠ Y, size(x)...))
+        ∂y = CRC.@thunk project_y(reshape(batched_adjoint(ΔZ) ⊠ X, size(y)...))
         return (CRC.NoTangent(), CRC.NoTangent(), ∂x, ∂y, CRC.NoTangent())
     end
     S = circulant_similarity(DotSimilarity(), x, y, W)

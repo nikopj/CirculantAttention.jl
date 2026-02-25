@@ -4,16 +4,19 @@ const CircAtt = CirculantAttention
 export CircAtt
 
 using CUDA, CUDA.CUSPARSE, cuDNN
+using CUDA: i32
 import Adapt
 
 using SparseArrays
 using LinearAlgebra
+using KernelAbstractions.Extras: @unroll
 
 using NNlib
 import ChainRulesCore as CRC
 import Zygote
 
 include("array.jl")
+include("broadcast.jl")
 include("circulant.jl")
 export Circulant, circulant
 

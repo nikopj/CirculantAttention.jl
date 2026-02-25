@@ -57,6 +57,7 @@ results = DataFrame(
     windowsize = Int[],
     function_name = String[],
     time_ms = Float64[],
+    gflops = Float64[],
 )
 
 commit = git_commit()
@@ -71,15 +72,21 @@ for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsiz
 
     # similarity
     t = bench_gpu(() -> circulant_similarity(DistanceSimilarity(), x, y, windowsize))
-    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_similarity", t))
+    flops = tensorsize[4] * tensorsize[1] * tensorsize[2] * (2*tensorsize[3] - 1) * (windowsize^2)
+    gf = flops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_similarity", t, gf))
 
     # attention
     t = bench_gpu(() -> circulant_attention(A, x))
-    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_attention", t))
+    flops = tensorsize[4] * tensorsize[1] * tensorsize[2] * tensorsize[3] * (2*windowsize^2 - 1)
+    gf = flops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_attention", t, gf))
 
     # softmax
     t = bench_gpu(() -> NNlib.softmax(A))
-    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "softmax", t))
+    flops = tensorsize[4] * tensorsize[1] * tensorsize[2] * tensorsize[3] * 15 * (2*windowsize^2 - 1 + 1) # 15 bc exp, +1 bc division in softmax
+    gf = flops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "softmax", t, gf))
 end
 
 CSV.write("benchmark/benchmark_results.csv", results; append=true)

@@ -144,7 +144,7 @@ locations are determined by the windowsize `W` and number of spatial dimensions 
 
 See also [`DotSimilarity`](@ref), [`DistanceSimilarity`](@ref).
 """
-function circulant_similarity(simfun::AbstractSimilarity, x::AbstractArray{T,N}, y::AbstractArray{T,N}, W::Integer)::Circulant where {T,N}
+function circulant_similarity(simfun::AbstractSimilarity, x::AbstractArray{Tx,N}, y::AbstractArray{Ty,N}, W::Integer)::Circulant where {Tx, Ty, N}
     Tv = simval_dtype(simfun, x, y)
     S = Circulant{Tv}(W, (size(x)[1:N-2]..., 1, size(x, N)))
     circulant_similarity!(S, simfun, x, y)
@@ -215,13 +215,18 @@ function circulant_similarity_kernel!(
     return nothing
 end
 
-function circulant_softmax!(Y::CuSparseArrayCSR, X::CuSparseArrayCSR=Y)
-    V = reshape(X.nzVal, :, X.dims[1], prod(X.dims[3:end]))
-    U = reshape(Y.nzVal, size(V))
-    NNlib.softmax!(U, V; dims=1)
-    return Y
+function circulant_softmax(X::Circulant)
+    V = windowview(X)
+    R = NNlib.softmax(V; dims=1)
+    return Circulant(R, kernel_length(X), spatial_size(X)) 
 end
-circulant_softmax(X::CuSparseArrayCSR) = circulant_softmax!(copy(X), X)
+
+function circulant_softmax!(X::Circulant{T,N,M,S}, Y::Circulant{T,N,M,S}=X) where {T,N,M,S}
+    V = windowview(X)
+    U = windowview(Y)
+    R = NNlib.softmax!(V, U; dims=1)
+    return X
+end
 
 function NNlib.softmax!(A::Circulant{T,N,M}, B::Circulant{T,N,M}=A) where {T,N,M} 
     circulant_softmax!(A.data, B.data)

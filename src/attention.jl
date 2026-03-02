@@ -46,11 +46,11 @@ splitheads(x::AbstractArray{T,N}, nheads) where {T,N} = reshape(x, ntuple(i->siz
 function circulant_mh_adjacency(simfun, x::AbstractArray{T,N}, y, W::Integer, nheads::Int) where {T, N}
     xr, yr = splitheads.((x, y), nheads)
     A = circulant_adjacency(simfun, xr, yr, W)
-    # return reshape(A, :, :, nheads, size(x, N))
-    return _circulant_reshape(A, :, :, nheads, size(x, N))
+    return reshape(A, :, :, nheads, size(x, N))
+    # return _circulant_reshape(A, :, :, nheads, size(x, N))
 end
 
-function circulant_attention!(y::AbstractArray{T, N}, A::Circulant{Ta, Na}, x::AbstractArray{T, N}) where {Ta, Na, T, N}
+function circulant_attention!(y::AbstractArray{Ty, N}, A::Circulant{Ta, Na}, x::AbstractArray{Tx, N}) where {Ty, Ta, Na, Tx, N}
     @assert spatial_dims(A) == N - 2 "spatial-dims ($(spatial_dims(A)) of A must match spatial dims of x ($(N-2))"
     X = reshape(x, :, size(x)[N-1:end]...)
     Y = reshape(y, :, size(y)[N-1:end]...)
@@ -65,15 +65,19 @@ end
 Applies circulant matrix `A` to `x`.
 See also [`circulant_adjacency`](@ref).
 """
-circulant_attention(A::Circulant, x) = circulant_attention!(similar(x), A, x)
+function circulant_attention(A::Circulant{Ta}, x::AbstractArray{Tx}) where {Ta, Tx} 
+    y = similar(x, promote_type(Ta, Tx))
+    circulant_attention!(y, A, x)
+    return y
+end
 
 const ⊗ = circulant_attention
 
-function circulant_transposed_attention!(y::AbstractArray{T, N}, A::Circulant{Ta, Na}, x::AbstractArray{T, N}) where {Ta, Na, T, N}
+function circulant_transposed_attention!(y::AbstractArray{Ty, N}, A::Circulant{Ta, Na}, x::AbstractArray{T, N}) where {Ty, Ta, Na, T, N}
     @assert spatial_dims(A) == N - 2 "spatial-dims ($(spatial_dims(A)) of A must match spatial dims of x ($(N-2))"
     X = reshape(x, :, size(x)[N-1:end]...)
     Y = reshape(y, :, size(y)[N-1:end]...)
-    At = NNlib.batched_transpose(reshape(A, :, :, :))
+    At = NNlib.batched_adjoint(reshape(A, :, :, :))
     NNlib.batched_mul!(Y, At, X)
     return y
 end

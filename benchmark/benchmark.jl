@@ -89,5 +89,5 @@ for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsiz
     push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "softmax", t, gf))
 end
 
-CSV.write("benchmark/benchmark_results.csv", results; append=true)
-println("Saved benchmark_results.csv")
+# CSV.write("benchmark/benchmark_results.csv", results; append=true)
+# println("Saved benchmark_results.csv")

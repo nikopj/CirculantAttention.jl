@@ -21,7 +21,8 @@ include("circulant.jl")
 export Circulant, circulant
 
 include("similarity.jl")
-export circulant_similarity, circulant_similarity!, DotSimilarity, DistanceSimilarity
+export circulant_similarity, circulant_similarity!
+export RealDotSimilarity, DistanceSimilarity, PIDotSimilarity, PIDistanceSimilarity
 export circulant_adjacency, circulant_adjacency!
 
 include("attention.jl")

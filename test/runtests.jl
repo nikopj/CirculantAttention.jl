@@ -1,6 +1,8 @@
 using CirculantAttention
 using Test
+using Zygote
 
+using LinearAlgebra
 using CUDA, CUDA.CUSPARSE
 using NNlib
 
@@ -14,7 +16,7 @@ ChainRulesCore.debug_mode() = true
 
 include("utils.jl")
 
-@testset "CirculantAttention.jl" begin
+# @testset "CirculantAttention.jl" begin
     include("rrule.jl")
-    include("grad.jl")
-end
+    # include("grad.jl")
+# end

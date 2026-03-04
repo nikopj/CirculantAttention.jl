@@ -63,6 +63,17 @@ function (project::CRC.ProjectTo{CuSparseArrayCSR})(dx::AbstractArray)
     CuSparseArrayCSR(copy(project.rowPtr), copy(project.colVal), nzVal, project.sz)
 end
 
+function (project::CRC.ProjectTo{CuSparseArrayCSR})(dx::CuArray)
+    nzVal = CUDA.zeros(typeof(project.element(one(Float32))), map(length, project.axes)...)
+    # dx is in Circulant space (ndims = nzVal_ndims + 1); drop the first dim
+    dx_nz = reshape(dx, size(nzVal, 1), size(dx)[2:end]...)
+    nzVal .= dx_nz
+    CuSparseArrayCSR(copy(project.rowPtr), copy(project.colVal), nzVal, project.sz)
+end
+
+similar_nzVal(project::CRC.ProjectTo{CuSparseArrayCSR}) =
+    CUDA.zeros(typeof(project.element(one(Float32))), map(length, project.axes)...)
+
 # ==============================================================================
 # CuSparseArrayCSR constructor rrule
 #
@@ -116,6 +127,10 @@ end
 # Zygote.FillArrays.Fill — uniform scalar tangent (e.g. from sum(A) backprop).
 # Delegate to embedded CSR projector which handles Fill → nzVal construction.
 function (project::CRC.ProjectTo{Circulant})(dx::Zygote.FillArrays.AbstractFill)
+    Circulant(project.data(dx), project.kernel_length, project.spatial_size)
+end
+
+function (project::CRC.ProjectTo{Circulant})(dx::CuArray)
     Circulant(project.data(dx), project.kernel_length, project.spatial_size)
 end
 

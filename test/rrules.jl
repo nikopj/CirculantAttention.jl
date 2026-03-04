@@ -1,6 +1,6 @@
-# @testset "Low-level Circulant rrules" begin
+@testset "Low-level Circulant rrules" begin
 
-# for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
+for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
     ws    = 3
     batch = 2
     spatdims = ntuple(_ -> 8, nspatdims)
@@ -92,7 +92,6 @@
     @testset "CuArray .* Circulant (batch scale) [$tag]" begin
         nzval_dim = ndims(A.data.nzVal)
         c     = CUDA.randn(real(elty), ntuple(_ -> 1, ndims(A) - 1)..., batch)
-        @warn size(c .* A)
         gs    = Zygote.gradient((c, a) -> sum(real.((c .* a))), c, A)
         ∂c    = Array(gs[1])
         ∂A_nz = nz_cpu(gs[2])
@@ -149,6 +148,6 @@
         @test all(≈(c;     atol=1e-4), nz_cpu(gs[2]))
     end
 
-# end  # for elty, nspatdims
+end  # for elty, nspatdims
 
-# end  # @testset
+end  # @testset

@@ -1,3 +1,4 @@
+# attention.jl
 const BatchedCirculant{T,N,M,S} = Union{
     Circulant{T, N, M, S},
     NNlib.BatchedTranspose{T, <:Circulant{T,N,M,S}},

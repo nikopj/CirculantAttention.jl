@@ -19,6 +19,7 @@ include("array.jl")
 include("broadcast.jl")
 include("circulant.jl")
 export Circulant, circulant
+export kernel_length, spatial_size, spatial_dims, windowview
 
 include("similarity.jl")
 export circulant_similarity, circulant_similarity!

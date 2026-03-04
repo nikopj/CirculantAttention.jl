@@ -1,7 +1,5 @@
-using Zygote
-using NNlib
-using LinearAlgebra
-
+# grad.jl
+ 
 @testset "grad" begin
     nheads = 2
     windowsize = 3

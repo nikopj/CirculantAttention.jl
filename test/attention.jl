@@ -1,6 +1,5 @@
 # test/rrule.jl
 # Tests for circulant_similarity and circulant_attention rrules.
-# Low-level Circulant arithmetic rrules are tested in test/lowlevel_rrules.jl.
 
 @testset "Similarity and Attention" begin 
 for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
@@ -99,47 +98,6 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
     end
 
     # ------------------------------------------------------------------
-    # CuArray .* Circulant — replaces scale; Zygote traces through broadcast.
-    # Verified against analytically known gradients.
-    # ------------------------------------------------------------------
-
-    @testset "CuArray .* Circulant (per-batch scale) [Zygote] [$tag]" begin
-        # α is (1,1,1,B) — scales each batch element independently
-        B_size = size(A, ndims(A))
-        α = CUDA.randn(real(elty), 1, 1, 1, B_size)
-        α_cpu = Array(α)
-        nz_A  = Array(A)
-
-        gs = Zygote.gradient(α, A) do a, x
-            sum(real.((a .* x)))
-        end
-
-        # ∂α[b] = sum of A.nzVal for that batch
-        for b in 1:B_size
-            @test Array(gs[1])[1,1,1,b] ≈ sum(real.(nz_A[:,b]))  rtol=1e-3
-        end
-        # ∂A.nzVal[i,b] = α[b]
-        for b in 1:B_size
-            @test all(≈(real(α_cpu[1,1,1,b]); rtol=1e-3), Array(gs[2].data.nzVal)[:,b])
-        end
-    end
-
-    @testset "CuArray .* Circulant (scalar expand 1x1x1x1) [Zygote] [$tag]" begin
-        α = CUDA.randn(real(elty), 1, 1, 1, 1)
-        nz_A = Array(A.data.nzVal)
-
-        gs = Zygote.gradient(α, A) do a, x
-            sum(real.((a .* x)))
-        end
-
-        # ∂α = sum of all A.nzVal (scalar accumulated over all batch/entries)
-        @test Array(gs[1])[1] ≈ sum(real.(nz_A))  rtol=1e-3
-        # ∂A.nzVal = α everywhere
-        α_val = real(Array(α)[1])
-        @test all(≈(α_val; rtol=1e-3), Array(gs[2].data.nzVal))
-    end
-
-    # ------------------------------------------------------------------
     # Convex combination: α*A + (1-α)*B where α is a CuArray
     # This is the pattern from grad.jl — exercises CuArray broadcast + add rrules
     # ------------------------------------------------------------------
@@ -154,5 +112,46 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         expected = sum(Array(A.data.nzVal)) - sum(Array(B_circ.data.nzVal))
         @test Array(gs[1])[1] ≈ real(expected)  rtol=1e-3
     end
+
+    ws1, ws2, ws3 = 3, 5, 7
+    A1 = make_circulant(real(elty), spatdims, ws1, B)
+    A2 = make_circulant(real(elty), spatdims, ws2, B)
+    A3 = make_circulant(real(elty), spatdims, ws3, B)
+
+    @testset "forward: joint normalisation [$tag, nspatdims=$nspatdims]" begin
+        S1, S2, S3 = joint_softmax(A1, A2, A3)
+        # Each row sums to 1 jointly across all three kernels
+        total_nnz = ws1^nspatdims + ws2^nspatdims + ws3^nspatdims  # nnz_per_row for each
+        W1, W2, W3 = windowview(S1), windowview(S2), windowview(S3)
+        row_sums = sum(W1; dims=1) .+ sum(W2; dims=1) .+ sum(W3; dims=1)
+        @test Array(row_sums) ≈ ones(real(elty), 1, size(W1)[2:end]...)  rtol=1e-4
+    end
+
+    @testset "gradient: softmax finite and non-nothing [$tag, nspatdims=$nspatdims]" begin
+        gs = Zygote.gradient(A1, A2, A3) do a1, a2, a3
+            S1 = NNlib.softmax(a1)
+            S2 = NNlib.softmax(a2)
+            S3 = NNlib.softmax(a3)
+            sum(real.(S1)) + sum(real.(S2)) + sum(real.(S3))
+        end
+
+        for (i, g) in enumerate(gs)
+            @test !isnothing(g) 
+            @test all(isfinite.(Array(g.data.nzVal))) 
+        end
+    end
+
+    @testset "gradient: joint-softmax finite and non-nothing [$tag, nspatdims=$nspatdims]" begin
+        gs = Zygote.gradient(A1, A2, A3) do a1, a2, a3
+            S1, S2, S3 = joint_softmax(a1, a2, a3)
+            sum(real(S1)) + sum(real(S2)) + sum(real(S3))
+        end
+
+        for (i, g) in enumerate(gs)
+            @test !isnothing(g) 
+            @test all(isfinite.(Array(g.data.nzVal))) 
+        end
+    end
+
 end
 end

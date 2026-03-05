@@ -15,14 +15,14 @@ import FiniteDifferences as FD
 CUDA.allowscalar(false)
 ChainRulesCore.debug_mode() = true
 
-TEST_ELTYPES = (Float32,) #ComplexF32)
-TEST_SPATDIMS = (1,) #2)
+TEST_ELTYPES = (Float32,ComplexF32,)
+TEST_SPATDIMS = (1,2,)
 
 include("utils.jl")
 
-# @testset "CirculantAttention.jl" begin
+@testset "CirculantAttention.jl" begin
     include("array.jl")
     include("rrules.jl")
-    # include("attention.jl")
-    # include("grad.jl")
-# end
+    include("attention.jl")
+    include("grad.jl")
+end

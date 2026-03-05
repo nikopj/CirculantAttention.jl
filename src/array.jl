@@ -45,12 +45,25 @@ Base.size(A::Circulant)              = size(A.data)
 Base.size(A::Circulant, i::Int)      = size(A.data, i)
 Base.ndims(A::Circulant)             = ndims(A.data)
 Base.getindex(A::Circulant, idxs...) = Base.getindex(A.data, idxs...)
-Base.similar(A::Circulant{T,N,M}) where {T,N,M} = Circulant(similar(A.data), M, spatial_size(A))
 Base.copy(A::Circulant{T,N,M})    where {T,N,M} = Circulant(copy(A.data), M, spatial_size(A))
+
+Base.similar(A::Circulant{T,N,M}) where {T,N,M} = Circulant(similar(A.data), M, spatial_size(A))
+Base.similar(A::Circulant{<:Any,N,M}, ::Type{T}) where {T,N,M} = Circulant(similar(A.data, T), M, spatial_size(A))
+Base.similar(A::CuSparseArrayCSR, ::Type{T}) where T = CuSparseArrayCSR(copy(A.rowPtr), copy(A.colVal), similar(A.nzVal, T), size(A))
 
 function Base.show(io::IOContext, m::MIME"text/plain", A::Circulant{T,N,M}) where {T,N,M}
     print(io, typeof(A), " with kernel-length $M, spatial-size $(spatial_size(A)), and data,\n")
     show(io, m, A.data)
+end
+
+# useful for showing the results of CircAtt.joint_softmax
+function Base.show(io::IO, m::MIME"text/plain", As::Tuple{Vararg{Circulant}})
+    print(io, length(As), "-tuple of Circulant matrices:\n")
+    for (i, A) in enumerate(As)
+        print(io, "  [$i] ")
+        show(io, m, A)
+        i < length(As) && print(io, "\n")
+    end
 end
 
 function Base.repeat(A::Circulant{T,N,M}, dims::Int...) where {T,N,M}

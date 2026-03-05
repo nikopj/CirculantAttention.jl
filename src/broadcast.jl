@@ -1,29 +1,17 @@
 # ==============================================================================
 # Broadcast infrastructure for CuSparseArrayCSR and Circulant
 #
-# Design:
-#   CuSparseCSRStyle — handles CuSparseArrayCSR operands (unchanged)
-#   CirculantStyle   — overrides `copy` with a body Zygote can trace:
-#                        windowview (reshape) → f.(CuArray) → reshape →
-#                        CuSparseArrayCSR (rrule) → Circulant (rrule)
+# nzVal layout:      (nnz_per_row * n_rows, ch..., batch...)
+# windowview layout: (nnz_per_row, n_rows, ch..., batch...)
 #
-# We override `copy` rather than `broadcasted` because Zygote's broadcast AD
-# expects `broadcasted` to return a lazy Broadcasted object; overriding it to
-# return a concrete Circulant breaks Zygote's pullback construction. By putting
-# the differentiable logic in `copy`, Zygote traces through the body directly.
-#
-# Dispatch is handled by `_circ_copy(f, args...)` which matches on arg types.
-#
-# Batch expansion: when operands differ in batch size, the smaller one's
-# rowPtr/colVal are repeated via `repeat` (which has an explicit rrule).
-# The nzVal expansion is handled naturally by broadcasting in window space.
-#
-# In-place `copyto!` is not on the AD hot path.
-#
-# nzVal layout:      (nnz_per_row * n_rows, batch...)
-# windowview layout: (nnz_per_row, n_rows, batch...)
+# AD strategy for CirculantStyle:
+#   CRC rrule for broadcasted(::CirculantStyle, f, args...).
+#   Forward: lift Circulant args → windowview CuArrays, run f.(wargs...) as a
+#   plain CuArray broadcast, wrap result back into a Circulant.
+#   Pullback: runs entirely in window (CuArray) space via Zygote's CuArray AD.
+#   Zygote never calls sum() or unbroadcast() on a Circulant.
 # ==============================================================================
- 
+
 # ------------------------------------------------------------------------------
 # Broadcast styles
 # ------------------------------------------------------------------------------
@@ -36,7 +24,7 @@ Base.BroadcastStyle(::CuSparseCSRStyle, ::Broadcast.AbstractArrayStyle)   = CuSp
 Base.BroadcastStyle(::CuSparseCSRStyle, ::Broadcast.DefaultArrayStyle{0}) = CuSparseCSRStyle()
 Base.BroadcastStyle(::CuSparseCSRStyle, ::Broadcast.DefaultArrayStyle)    = CuSparseCSRStyle()
 
-struct CirculantStyle <: Broadcast.BroadcastStyle end
+struct CirculantStyle <: Broadcast.AbstractArrayStyle{Any} end
 CirculantStyle(::Val{N}) where N = CirculantStyle()
 
 Base.BroadcastStyle(::Type{<:Circulant})                                  = CirculantStyle()
@@ -47,166 +35,124 @@ Base.BroadcastStyle(::CirculantStyle, ::CuSparseCSRStyle)                 = Circ
 Base.BroadcastStyle(::CuSparseCSRStyle, ::CirculantStyle)                 = CirculantStyle()
 
 # ------------------------------------------------------------------------------
-# Helpers
+# Core helpers
 # ------------------------------------------------------------------------------
 
-# Repeat rowPtr/colVal along batch dims to match an expanded nzVal shape.
-# reps[i] = size(nzVal, i+1) ÷ size(rowPtr, i+1) for each batch dim.
+# Repeat rowPtr/colVal along batch dims to match an expanded nzVal.
 function _expand_structure(X::Circulant, nzVal::CuArray)
-    reps = ntuple(i -> size(nzVal, i+1) ÷ size(X.data.rowPtr, i+1), ndims(X) - 2)
+    reps   = ntuple(i -> size(nzVal, i+1) ÷ size(X.data.rowPtr, i+1), ndims(X) - 2)
     rowPtr = repeat(X.data.rowPtr, 1, reps...)
     colVal = repeat(X.data.colVal, 1, reps...)
     return rowPtr, colVal
 end
 
-# Build a Circulant from a window-space result W, using X as the structure reference.
-# Handles both same-size and batch-expanded cases.
-function _circ_from_window(W, X::Circulant)
-    nzVal  = reshape(W, size(X.data.nzVal, 1), size(W)[3:end]...)
+# Wrap a window-space CuArray back into a Circulant using X as structure reference.
+function _circ_from_window(W::CuArray, X::Circulant)
+    nzVal          = reshape(W, size(X.data.nzVal, 1), size(W)[3:end]...)
     rowPtr, colVal = _expand_structure(X, nzVal)
-    sz     = (size(X, 1), size(X, 2), size(nzVal)[2:end]...)
-    data   = CuSparseArrayCSR(rowPtr, colVal, nzVal, sz)
-    Circulant(data, kernel_length(X), spatial_size(X))
+    sz             = (size(X, 1), size(X, 2), size(nzVal)[2:end]...)
+    Circulant(CuSparseArrayCSR(rowPtr, colVal, nzVal, sz), kernel_length(X), spatial_size(X))
 end
 
-function CRC.rrule(::typeof(_circ_from_window), W, X::Circulant)
-    result = _circ_from_window(W, X)
-    function _circ_from_window_back(Δ)
-        Δ  = _concretize_tangent(CRC.unthunk(Δ), result)
-        # ∂W: un-reshape nzVal back to window shape
-        ∂W = reshape(Δ.data.nzVal, size(W))
-        # ∂X: structure (rowPtr/colVal/sz) is not differentiated
-        return CRC.NoTangent(), ∂W, CRC.ZeroTangent()
-    end
-    return result, _circ_from_window_back
-end
+# Lift args to window space: Circulant → windowview, everything else passthrough.
+_to_window(a::Circulant) = windowview(a)
+_to_window(a)            = a
 
-function CRC.rrule(::typeof(windowview), X::Circulant)
-    W = windowview(X)
-    function windowview_back(∂W)
-        ∂W = CRC.unthunk(∂W)
-        # ∂W is in window space; wrap back into a Circulant via _circ_from_window
-        ∂X = _circ_from_window(∂W, X)
-        return CRC.NoTangent(), ∂X
-    end
-    return W, windowview_back
+# Largest-batch Circulant in args — used as structure reference.
+function _ref_circulant(args)
+    circs = filter(a -> a isa Circulant, collect(args))
+    isempty(circs) && error("No Circulant in broadcast args")
+    argmax(c -> size(c)[end], circs)
 end
 
 # ------------------------------------------------------------------------------
-# CirculantStyle — copy + Zygote adjoint
-#
-# Zygote intercepts at `broadcasted` level (before copy) via its generic
-# @adjoint broadcasted(::AbstractArrayStyle, f, args...) which calls
-# unbroadcast(arg, Δ) for each arg. unbroadcast on a Circulant calls
-# sum(::Circulant; dims=...) with bogus sentinel dims — unavoidable without
-# intercepting at the broadcasted level ourselves.
-#
-# Solution: define a Zygote @adjoint for broadcasted(::CirculantStyle, ...)
-# that computes gradients entirely in window space, bypassing unbroadcast.
-# The forward pass calls copy → _circ_copy → windowview → f.(CuArray) →
-# _circ_from_window, same as before. The adjoint re-broadcasts the upstream
-# tangent against each primal arg in window space and wraps back.
+# CirculantStyle forward broadcast
 # ------------------------------------------------------------------------------
+
+# Lift a single broadcast arg to window space.
+# Zygote.FillArrays.Fill in Circulant space (N×N×...) can't broadcast against
+# windowview (nnz×N×...) — extract scalar value instead.
+function _to_window_arg(a::Zygote.FillArrays.AbstractFill, ref::Circulant)
+    # If shape matches windowview, pass through; otherwise use scalar value
+    w = windowview(ref)
+    if size(a) == size(w)
+        a
+    else
+        Zygote.FillArrays.getindex_value(a)
+    end
+end
+_to_window_arg(a::Circulant, _) = windowview(a)
+_to_window_arg(a, _)            = a
 
 function Base.copy(bc::Broadcast.Broadcasted{CirculantStyle})
-    args = map(bc.args) do a
+    args  = map(bc.args) do a
         a isa Broadcast.Broadcasted ? copy(a) : a
     end
-    _circ_copy(bc.f, args...)
+    ref   = _ref_circulant(args)
+    wargs = map(a -> _to_window_arg(a, ref), args)
+    W     = bc.f.(wargs...)
+    _circ_from_window(W, ref)
 end
 
-# Zygote adjoint for CirculantStyle broadcast — handles all f uniformly.
-# Gradients are computed in window (nzVal) space to avoid unbroadcast on Circulant.
-# Lift all args to window space (CuArray), compute forward + backward entirely
-# in window space using Zygote's existing CuArray broadcast AD, then wrap
-# Circulant results back. This bypasses unbroadcast(::CuArray, ::Circulant).
-function _window_args(args)
-    map(args) do a
-        a isa Circulant ? windowview(a) : a
-    end
-end
+# ------------------------------------------------------------------------------
+# CirculantStyle AD — CRC rrule for broadcasted
+#
+# Zygote intercepts at broadcasted() level before copy() is ever called.
+# We register a CRC rrule so the pullback runs in window (CuArray) space,
+# delegating to Zygote's existing CuArray broadcast AD for all f.
+# ------------------------------------------------------------------------------
 
-Zygote.@adjoint function Base.Broadcast.materialize(bc::Broadcast.Broadcasted{CirculantStyle})
-    args = map(bc.args) do a
-        a isa Broadcast.Broadcasted ? Base.Broadcast.materialize(a) : a
-    end
-    f = bc.f
-    wargs = _window_args(args)
-    W, back_w = Zygote._pullback(Zygote.__context__, Base.Broadcast.broadcasted, f, wargs...)
-    Wmat, back_mat = Zygote._pullback(Zygote.__context__, Base.Broadcast.materialize, W)
-    ref = args[findfirst(a -> a isa Circulant, args)]
-    result = _circ_from_window(Wmat, ref)
+# Use Zygote.@adjoint so the pullback is registered in Zygote's adjoint system
+# (not CRC), matching how Zygote intercepts broadcasted() calls.
+Zygote.@adjoint function Broadcast.broadcasted(::CirculantStyle, f, args...)
+    ref   = _ref_circulant(args)
+    wargs = map(a -> _to_window_arg(a, ref), args)
 
-    function materialize_circulant_back(Δ)
-        Δ = _concretize_tangent(Zygote.unthunk(Δ), result)
-        Δw = windowview(Δ)
-        # Backprop through materialize then through broadcasted in window space
-        ∂W     = back_mat(Δw)[2]         # ∂Wmat → ∂W (Broadcasted tangent)
-        ∂wargs = back_w(∂W)              # (nothing, ∂f, ∂warg1, ∂warg2, ...)
-        # Convert window-space arg gradients back to Circulant/CuArray gradients
-        ∂args = map(args, ∂wargs[3:end]) do arg, ∂warg
-            if arg isa Circulant
-                ∂warg === nothing ? nothing : _circ_from_window(∂warg, arg)
-            else
-                ∂warg  # CuArray or Number gradient, already correct shape
-            end
+    # Forward + backward in window (CuArray) space via Zygote's CuArray AD.
+    # This avoids Zygote ever calling unbroadcast() or sum() on a Circulant.
+    W, back     = Zygote._pullback(__context__, Broadcast.broadcasted, f, wargs...)
+    Wmat, bmat  = Zygote._pullback(__context__, Broadcast.materialize, W)
+    result      = _circ_from_window(Wmat, ref)
+
+    function broadcasted_circ_back(Δ)
+        Δ  = _concretize_tangent(Zygote.unthunk(Δ), result)
+        Δw = windowview(Δ)                          # upstream as plain CuArray
+        ∂W     = bmat(Δw)[2]                        # push through materialize
+        dback  = back(∂W)                           # push through broadcasted
+        ∂wargs = Base.tail(Base.tail(dback))        # drop (∂broadcasted_fn, ∂f)
+        ∂args  = map(args, ∂wargs) do arg, ∂w
+            ∂w = Zygote.unthunk(∂w)
+            ∂w === nothing && return nothing
+            arg isa Circulant ? _circ_from_window(∂w, arg) : ∂w
         end
         return nothing, nothing, ∂args...
     end
-    return result, materialize_circulant_back
+    return result, broadcasted_circ_back
 end
 
-# Unary
-function _circ_copy(f, X::Circulant)
-    _circ_from_window(f.(windowview(X)), X)
+# Override Zygote's generic AbstractArrayStyle adjoint for CirculantStyle.
+# Without this, Zygote's @adjoint broadcasted(::AbstractArrayStyle, ...) fires
+# first (CirculantStyle <: AbstractArrayStyle) and calls unbroadcast on Circulant.
+
+
+# ------------------------------------------------------------------------------
+# In-place CirculantStyle — not on AD path
+# ------------------------------------------------------------------------------
+
+function Base.copyto!(dest::Circulant, bc::Broadcast.Broadcasted{CirculantStyle})
+    args = map(bc.args) do a
+        a isa Broadcast.Broadcasted ? copy(a) : a
+    end
+    windowview(dest) .= bc.f.(map(_to_window, args)...)
+    return dest
 end
 
-# Circulant OP Circulant
-function _circ_copy(f, X::Circulant, Y::Circulant)
-    ref = size(X)[end] >= size(Y)[end] ? X : Y
-    _circ_from_window(f.(windowview(X), windowview(Y)), ref)
-end
-
-# Scalar OP Circulant / Circulant OP Scalar
-_circ_copy(f, c::Number,   X::Circulant) = _circ_from_window(f.(c, windowview(X)), X)
-_circ_copy(f, X::Circulant, c::Number)   = _circ_from_window(f.(windowview(X), c), X)
-
-# CuArray OP Circulant / Circulant OP CuArray
-_circ_copy(f, c::CuArray,   X::Circulant) = _circ_from_window(f.(c, windowview(X)), X)
-_circ_copy(f, X::Circulant, c::CuArray)   = _circ_from_window(f.(windowview(X), c), X)
-
-# Pipe: X .|> f  — Julia wraps f in a RefValue as a broadcast scalar
-_circ_copy(::typeof(|>), X::Circulant, f::Base.RefValue) = _circ_from_window(windowview(X) .|> f, X)
-
-# AbstractArray OP Circulant / Circulant OP AbstractArray
-# Handles Fill, dense tangents, and other array-likes from Zygote pullbacks.
-# The incoming array is in Circulant space (shape N×N×ch×batch), but windowview
-# has shape (nnz_per_row×N×ch×batch) — they can't broadcast directly.
-# For Fill (uniform scalar) we extract the value and re-fill to window shape.
-# For other arrays we route through _concretize_tangent to get a Circulant,
-# then dispatch to the Circulant×Circulant case.
-function _circ_copy(f, other::Zygote.Zygote.FillArrays.AbstractFill, X::Circulant)
-    W = f.(Zygote.Zygote.FillArrays.getindex_value(other), windowview(X))
-    _circ_from_window(W, X)
-end
-function _circ_copy(f, X::Circulant, other::Zygote.Zygote.FillArrays.AbstractFill)
-    W = f.(windowview(X), Zygote.Zygote.FillArrays.getindex_value(other))
-    _circ_from_window(W, X)
-end
-function _circ_copy(f, other::AbstractArray, X::Circulant)
-    _circ_copy(f, _concretize_tangent(other, X), X)
-end
-function _circ_copy(f, X::Circulant, other::AbstractArray)
-    _circ_copy(f, X, _concretize_tangent(other, X))
-end
-
-# Catch-all — error clearly rather than stack overflow
-function _circ_copy(f, args...)
-    throw(ArgumentError("Unsupported CirculantStyle broadcast: f=$(f), arg types=$(typeof.(args))"))
+function Base.copyto!(dest::Circulant, ::Broadcast.Broadcasted)
+    throw(ArgumentError("In-place broadcast into Circulant requires matching sparsity patterns."))
 end
 
 # ------------------------------------------------------------------------------
-# CuSparseCSRStyle — unchanged, not on Circulant AD path
+# CuSparseCSRStyle — not on Circulant AD path
 # ------------------------------------------------------------------------------
 
 function _csr_unary(f, X::CuSparseArrayCSR)
@@ -214,21 +160,21 @@ function _csr_unary(f, X::CuSparseArrayCSR)
 end
 
 function _csr_binary(f, X::CuSparseArrayCSR, Yw)
-    W      = f.(windowview(X), Yw)
-    nzVal  = reshape(W, size(X.nzVal, 1), size(W)[3:end]...)
-    reps   = ntuple(i -> size(nzVal, i+1) ÷ size(X.rowPtr, i+1), ndims(X) - 2)
+    W     = f.(windowview(X), Yw)
+    nzVal = reshape(W, size(X.nzVal, 1), size(W)[3:end]...)
+    reps  = ntuple(i -> size(nzVal, i+1) ÷ size(X.rowPtr, i+1), ndims(X) - 2)
     CuSparseArrayCSR(repeat(X.rowPtr, 1, reps...), repeat(X.colVal, 1, reps...),
                      nzVal, (size(X, 1), size(X, 2), size(nzVal)[2:end]...))
 end
 
-_csr_broadcast(f, X::CuSparseArrayCSR)                         = _csr_unary(nz -> f.(nz), X)
-_csr_broadcast(f, c::Number, X::CuSparseArrayCSR)              = _csr_unary(nz -> f.(c, nz), X)
-_csr_broadcast(f, X::CuSparseArrayCSR, c::Number)              = _csr_unary(nz -> f.(nz, c), X)
-_csr_broadcast(f, X::CuSparseArrayCSR, Y::CuSparseArrayCSR)    = _csr_binary((xw, yw) -> f.(xw, yw), X, windowview(Y))
-_csr_broadcast(f, c::CuArray, X::CuSparseArrayCSR)             = _csr_binary((xw, cw) -> f.(cw, xw), X, c)
-_csr_broadcast(f, X::CuSparseArrayCSR, c::CuArray)             = _csr_binary((xw, cw) -> f.(xw, cw), X, c)
-_csr_broadcast(f, other, X::CuSparseArrayCSR)                  = _csr_broadcast(f, _concretize_tangent(other, X), X)
-_csr_broadcast(f, X::CuSparseArrayCSR, other)                  = _csr_broadcast(f, X, _concretize_tangent(other, X))
+_csr_broadcast(f, X::CuSparseArrayCSR)                      = _csr_unary(nz -> f.(nz), X)
+_csr_broadcast(f, c::Number, X::CuSparseArrayCSR)           = _csr_unary(nz -> f.(c, nz), X)
+_csr_broadcast(f, X::CuSparseArrayCSR, c::Number)           = _csr_unary(nz -> f.(nz, c), X)
+_csr_broadcast(f, X::CuSparseArrayCSR, Y::CuSparseArrayCSR) = _csr_binary((xw, yw) -> f.(xw, yw), X, windowview(Y))
+_csr_broadcast(f, c::CuArray, X::CuSparseArrayCSR)          = _csr_binary((xw, cw) -> f.(cw, xw), X, c)
+_csr_broadcast(f, X::CuSparseArrayCSR, c::CuArray)          = _csr_binary((xw, cw) -> f.(xw, cw), X, c)
+_csr_broadcast(f, other, X::CuSparseArrayCSR)               = _csr_broadcast(f, _concretize_tangent(other, X), X)
+_csr_broadcast(f, X::CuSparseArrayCSR, other)               = _csr_broadcast(f, X, _concretize_tangent(other, X))
 
 function Base.copy(bc::Broadcast.Broadcasted{CuSparseCSRStyle})
     args = map(bc.args) do a
@@ -249,39 +195,6 @@ function Base.copyto!(dest::CuSparseArrayCSR, ::Broadcast.Broadcasted)
     throw(ArgumentError("In-place broadcast into CuSparseArrayCSR requires matching sparsity patterns."))
 end
 
-# ------------------------------------------------------------------------------
-# In-place CirculantStyle — not on AD path, keep as-is
-# ------------------------------------------------------------------------------
-
-function Base.copyto!(dest::Circulant, bc::Broadcast.Broadcasted{CirculantStyle})
-    # Realize any nested Broadcasted nodes
-    args = map(bc.args) do a
-        a isa Broadcast.Broadcasted ? copy(a) : a
-    end
-    f    = bc.f
-    dest_w = windowview(dest)
-    if length(args) == 1
-        x = args[1]
-        dest_w .= f.(x isa Circulant ? windowview(x) : x)
-    elseif length(args) == 2
-        x, y = args
-        xw = x isa Circulant ? windowview(x) : x
-        yw = y isa Circulant ? windowview(y) : y
-        dest_w .= f.(xw, yw)
-    else
-        throw(ArgumentError("In-place Circulant broadcast only supports unary and binary ops."))
-    end
-    return dest
-end
-
-function Base.copyto!(dest::Circulant, ::Broadcast.Broadcasted)
-    throw(ArgumentError("In-place broadcast into Circulant requires matching sparsity patterns."))
-end
-
-# ------------------------------------------------------------------------------
-# _csr_broadcast! — in-place for CuSparseCSRStyle
-# ------------------------------------------------------------------------------
-
 _csr_broadcast!(f, dest::CuSparseArrayCSR, X::CuSparseArrayCSR) =
     (windowview(dest) .= f.(windowview(X)))
 _csr_broadcast!(f, dest::CuSparseArrayCSR, c::Number, X::CuSparseArrayCSR) =
@@ -296,17 +209,17 @@ _csr_broadcast!(f, dest::CuSparseArrayCSR, X::CuSparseArrayCSR, c::CuArray) =
     (windowview(dest) .= f.(windowview(X), c))
 
 # ==============================================================================
-# _concretize_tangent — used by copyto! and any remaining pullbacks that
-# receive Fill/Tangent tangents and need a concrete CSR or Circulant.
+# _concretize_tangent — convert Fill/Tangent/generic tangents to concrete types
 # ==============================================================================
 
 _concretize_tangent(Δ::CuSparseArrayCSR, _::CuSparseArrayCSR) = Δ
-function _concretize_tangent(Δ::CRC.Tangent, ref::CuSparseArrayCSR)
+_concretize_tangent(Δ::CRC.Tangent, ref::CuSparseArrayCSR) =
     _concretize_tangent(CRC.unthunk(Δ.nzVal), ref)
-end
+_concretize_tangent(Δ::Base.ReshapedArray{<:Any,<:Any,<:CuSparseArrayCSR}, ref::CuSparseArrayCSR) =
+    _concretize_tangent(parent(Δ), ref)
 function _concretize_tangent(Δ::Zygote.FillArrays.AbstractFill, ref::CuSparseArrayCSR{T}) where T
-    CuSparseArrayCSR(copy(ref.rowPtr), copy(ref.colVal),
-                     CUDA.fill(T(Zygote.FillArrays.getindex_value(Δ)), size(ref.nzVal)...), size(ref))
+    nzVal = CUDA.fill(T(Zygote.FillArrays.getindex_value(Δ)), size(ref.nzVal)...)
+    CuSparseArrayCSR(copy(ref.rowPtr), copy(ref.colVal), nzVal, size(ref))
 end
 function _concretize_tangent(Δ, ref::CuSparseArrayCSR{T}) where T
     nzVal = similar(ref.nzVal); nzVal .= Δ
@@ -314,54 +227,190 @@ function _concretize_tangent(Δ, ref::CuSparseArrayCSR{T}) where T
 end
 
 _concretize_tangent(Δ::Circulant, _::Circulant) = Δ
-function _concretize_tangent(Δ::CRC.Tangent, ref::Circulant{T,N,M}) where {T,N,M}
+_concretize_tangent(Δ::CRC.Tangent, ref::Circulant{T,N,M}) where {T,N,M} =
     Circulant(_concretize_tangent(CRC.unthunk(Δ.data), ref.data), M, spatial_size(ref))
-end
-function _concretize_tangent(Δ, ref::Circulant{T,N,M}) where {T,N,M}
+function _concretize_tangent(Δ::Zygote.FillArrays.AbstractFill, ref::Circulant{T,N,M}) where {T,N,M}
     Circulant(_concretize_tangent(Δ, ref.data), M, spatial_size(ref))
 end
+# ReshapedArray wrapping a Circulant — unwrap and recurse
+_concretize_tangent(Δ::Base.ReshapedArray{<:Any,<:Any,<:Circulant}, ref::Circulant) =
+    _concretize_tangent(parent(Δ), ref)
+_concretize_tangent(Δ, ref::Circulant{T,N,M}) where {T,N,M} =
+    Circulant(_concretize_tangent(Δ, ref.data), M, spatial_size(ref))
 
 # ==============================================================================
-# Zygote.unbroadcast overloads for Circulant tangents
+# Zygote @adjoints for Circulant broadcast — intercept before Zygote's generic
+# Numeric×Numeric adjoints, which materialise dense N×N tangents we can't use.
 #
-# Zygote's generic broadcast AD calls unbroadcast(primal_arg, Δ) to reduce
-# the upstream tangent back to the shape of each primal argument. When Δ is
-# a Circulant, the default implementation calls sum(Δ; dims=...) with sentinel
-# dims that our sum doesn't handle. We intercept both cases and operate
-# directly on nzVal (a plain CuArray) to avoid touching CuSparseArrayCSR sum.
+# These fire for the user-level broadcasted(f, args...) call (no style arg),
+# which is more specific than broadcasted(::typeof(*), x::Numeric, y::Numeric).
+# Gradients are computed entirely in window (CuArray) space.
 # ==============================================================================
 
-# CuArray primal, Circulant tangent — ∂c needs spatial dims summed away.
-# nzVal has shape (nnz_flat, ch..., batch) while c has shape (1,1,...,batch).
-# Sum nzVal over all dims where c is size-1 relative to nzVal, then reshape.
+function _circ_broadcasted_back(f, args, result, Δ, __context__)
+    Δ  = _concretize_tangent(Zygote.unthunk(Δ), result)
+    Δw = windowview(Δ)
+    wargs = map(a -> _to_window_arg(a, result), args)
+    _, back = Zygote._pullback(__context__, (wa...) -> f.(wa...), wargs...)
+    ∂wargs = back(Δw)   # (∂f_closure, ∂warg1, ∂warg2, ...)
+    ∂args = map(args, Base.tail(∂wargs)) do arg, ∂w
+        ∂w = Zygote.unthunk(∂w)
+        ∂w === nothing && return nothing
+        arg isa Circulant ? _circ_from_window(∂w, arg) : ∂w
+    end
+    return (nothing, ∂args...)
+end
+
+Zygote.@adjoint function Broadcast.broadcasted(f, A::Circulant)
+    result = f.(A)
+    back(Δ) = _circ_broadcasted_back(f, (A,), result, Δ, __context__)
+    return result, back
+end
+
+# Tiebreakers for Zygote's specific unary adjoints (real, imag, conj, abs2,
+# tanh, identity) — Circulant <: Numeric so those methods are equally specific.
+for _f in (:real, :imag, :conj, :abs2, :tanh, :identity)
+    @eval Zygote.@adjoint function Broadcast.broadcasted(::typeof($_f), A::Circulant)
+        result = $_f.(A)
+        back(Δ) = _circ_broadcasted_back($_f, (A,), result, Δ, __context__)
+        return result, back
+    end
+end
+
+Zygote.@adjoint function Broadcast.broadcasted(f, A::Circulant, B::Circulant)
+    result = f.(A, B)
+    back(Δ) = _circ_broadcasted_back(f, (A, B), result, Δ, __context__)
+    return result, back
+end
+
+Zygote.@adjoint function Broadcast.broadcasted(f, c::CuArray, A::Circulant)
+    result = f.(c, A)
+    back(Δ) = _circ_broadcasted_back(f, (c, A), result, Δ, __context__)
+    return result, back
+end
+
+Zygote.@adjoint function Broadcast.broadcasted(f, A::Circulant, c::CuArray)
+    result = f.(A, c)
+    back(Δ) = _circ_broadcasted_back(f, (A, c), result, Δ, __context__)
+    return result, back
+end
+
+Zygote.@adjoint function Broadcast.broadcasted(f, c::Number, A::Circulant)
+    result = f.(c, A)
+    back(Δ) = _circ_broadcasted_back(f, (c, A), result, Δ, __context__)
+    return result, back
+end
+
+Zygote.@adjoint function Broadcast.broadcasted(f, A::Circulant, c::Number)
+    result = f.(A, c)
+    back(Δ) = _circ_broadcasted_back(f, (A, c), result, Δ, __context__)
+    return result, back
+end
+
+# Tiebreakers for Zygote's specific binary adjoints with Number/AbstractArray
+for _f in (:+, :-, :*, :/)
+    @eval Zygote.@adjoint function Broadcast.broadcasted(::typeof($_f), c::Number, A::Circulant)
+        result = $_f.(c, A)
+        back(Δ) = _circ_broadcasted_back($_f, (c, A), result, Δ, __context__)
+        return result, back
+    end
+    @eval Zygote.@adjoint function Broadcast.broadcasted(::typeof($_f), A::Circulant, c::Number)
+        result = $_f.(A, c)
+        back(Δ) = _circ_broadcasted_back($_f, (A, c), result, Δ, __context__)
+        return result, back
+    end
+    @eval Zygote.@adjoint function Broadcast.broadcasted(::typeof($_f), A::Circulant, B::Circulant)
+        result = $_f.(A, B)
+        back(Δ) = _circ_broadcasted_back($_f, (A, B), result, Δ, __context__)
+        return result, back
+    end
+    @eval Zygote.@adjoint function Broadcast.broadcasted(::typeof($_f), c::CuArray, A::Circulant)
+        result = $_f.(c, A)
+        back(Δ) = _circ_broadcasted_back($_f, (c, A), result, Δ, __context__)
+        return result, back
+    end
+    @eval Zygote.@adjoint function Broadcast.broadcasted(::typeof($_f), A::Circulant, c::CuArray)
+        result = $_f.(A, c)
+        back(Δ) = _circ_broadcasted_back($_f, (A, c), result, Δ, __context__)
+        return result, back
+    end
+end
+
+# ==============================================================================
+# Zygote.unbroadcast overloads
+#
+# Zygote's generic broadcasted adjoint calls unbroadcast(arg, Δ) for each arg.
+# When Δ is a Circulant it calls sum(Circulant; dims=...) with sentinel dims
+# that our sum doesn't support. We intercept the two failing cases and reduce
+# directly on nzVal (a plain CuArray).
+#
+# nzVal dim d corresponds to Circulant dim d+1 (spatial rows are flattened into
+# dim 1 of nzVal, so all other dims shift by 1).
+# ==============================================================================
+
+# CuArray primal, Circulant tangent: ∂c by summing nzVal over structural dims.
 function Zygote.unbroadcast(x::CuArray, x̄::Circulant)
-    nz   = x̄.data.nzVal
-    nd   = ndims(nz)
-    # dims of nzVal where x (broadcast in Circulant space) was effectively size-1
-    # x has ndims(x) dims; any nzVal dim beyond that is also size-1 in x
-    dims = Tuple(filter(1:nd) do d
-        # nzVal dim d corresponds to Circulant dim d+1
-        # (nzVal has spatial rows flattened into dim 1, so batch dims shift by 1)
-        circ_d = d + 1
-        circ_d > ndims(x) || size(x, circ_d) == 1
+    nz    = x̄.data.nzVal
+    nd_nz = ndims(nz)
+    nd_x  = ndims(x)
+    # nzVal dim d ↔ x dim (nd_x - nd_nz + d), aligned from the right (batch last)
+    dims = Tuple(filter(1:nd_nz) do d
+        xd = nd_x - nd_nz + d
+        xd < 1 || size(x, xd) == 1
     end)
     reduced = isempty(dims) ? nz : sum(nz; dims=dims)
-    # reduced has same ndims as nzVal but size-1 on summed dims;
-    # reshape to size(x) by dropping the extra leading dims
     reshape(reduced, size(x))
 end
 
-# Circulant primal, Circulant tangent — batch-expanding broadcast case.
-# Sum x̄.nzVal over dims where x.nzVal was size-1.
+# Circulant primal, CuArray tangent: x̄ is in Circulant space (e.g. result of
+# Δ .* conj.(c) where c::CuArray). x̄ has the shape of the broadcast result,
+# not nzVal shape. Extract the batch-dim values and broadcast to nzVal shape.
+function Zygote.unbroadcast(x::Circulant, x̄::CuArray)
+    nzVal  = similar(x.data.nzVal)
+    nd_nz  = ndims(nzVal)
+    nd_xbar = ndims(x̄)
+    # x̄ is in Circulant space (ndims = nd_nz+1) or broadcast-result space.
+    # Reshape to be broadcastable against nzVal by dropping the leading spatial
+    # dim (nzVal dim 1 = nnz_per_row*N rows; Circulant dims 1,2 = N×N matrix).
+    # Align from the right: batch dims must match.
+    x̄_aligned = if nd_xbar == nd_nz + 1
+        # Circulant space → extract batch tail, reshape to (1,...,1,batch...)
+        ntuple_ones = ntuple(_ -> 1, nd_nz - 1)
+        reshape(x̄, ntuple_ones..., size(x̄)[end])
+    else
+        x̄  # already compatible shape
+    end
+    nzVal .= x̄_aligned
+    data = CuSparseArrayCSR(x.data.rowPtr, x.data.colVal, nzVal, size(x.data))
+    Zygote._project(x, Circulant(data, kernel_length(x), spatial_size(x)))
+end
+
+# Circulant primal, CuArray tangent (e.g. Δ .* conj.(c) where c::CuArray).
+# x̄ is in Circulant space (N×N×ch×batch); broadcast it down to nzVal space
+# by aligning dims from the right and letting Julia broadcast the structural dims.
+function Zygote.unbroadcast(x::Circulant, x̄::CuArray)
+    nzVal  = similar(x.data.nzVal)
+    nd_nz  = ndims(nzVal)
+    nd_x̄   = ndims(x̄)
+    # Align x̄ dims to nzVal dims from the right (batch dim last in both).
+    # Any nzVal dim that has no corresponding x̄ dim gets size 1.
+    new_shape = ntuple(nd_nz) do d
+        xd = nd_x̄ - nd_nz + d
+        xd < 1 ? 1 : size(x̄, xd)
+    end
+    nzVal .= reshape(x̄, new_shape)   # broadcasts x̄ scalar/batch values across nzVal
+    data = CuSparseArrayCSR(x.data.rowPtr, x.data.colVal, nzVal, size(x.data))
+    Zygote._project(x, Circulant(data, kernel_length(x), spatial_size(x)))
+end
+
+# Circulant primal, Circulant tangent: ∂A by summing nzVal over size-1 dims.
 function Zygote.unbroadcast(x::Circulant, x̄::Circulant)
     size(x) == size(x̄) && return Zygote._project(x, x̄)
     nz   = x̄.data.nzVal
-    nd   = ndims(nz)
-    dims = Tuple(filter(1:nd) do d
+    dims = Tuple(filter(1:ndims(nz)) do d
         size(x.data.nzVal, d) == 1
     end)
     reduced = isempty(dims) ? nz : sum(nz; dims=dims)
     data = CuSparseArrayCSR(x.data.rowPtr, x.data.colVal, reduced, size(x.data))
     Zygote._project(x, Circulant(data, kernel_length(x), spatial_size(x)))
 end
-

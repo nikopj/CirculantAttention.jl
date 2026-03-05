@@ -23,10 +23,11 @@ export kernel_length, spatial_size, spatial_dims, windowview
 
 include("similarity.jl")
 export circulant_similarity, circulant_similarity!
-export RealDotSimilarity, DistanceSimilarity, PIDotSimilarity, PIDistanceSimilarity
+export DotSimilarity, RealDotSimilarity, DistanceSimilarity, PIDotSimilarity, PIDistanceSimilarity
 export circulant_adjacency, circulant_adjacency!
 
 include("attention.jl")
+export joint_softmax
 export circulant_attention, circulant_mh_attention, circulant_mh_adjacency, ⊗, ⨷ # \otimes and \Otimes
 
 include("batchedmul.jl")

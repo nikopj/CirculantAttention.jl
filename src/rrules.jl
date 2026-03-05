@@ -49,30 +49,19 @@ function (project::CRC.ProjectTo{CuSparseArrayCSR})(dx::CRC.AbstractZero)
     return dx
 end
 
-# Zygote.FillArrays.Fill — broadcast scalar tangent across the nzVal shape.
+# Zygote.Zygote.FillArrays.Fill — broadcast scalar tangent across the nzVal shape.
 # project.element is a ProjectTo{T} — call it on the scalar to get a concrete T.
-function (project::CRC.ProjectTo{CuSparseArrayCSR})(dx::Zygote.FillArrays.AbstractFill)
-    val   = project.element(Zygote.FillArrays.getindex_value(dx))
+function (project::CRC.ProjectTo{CuSparseArrayCSR})(dx::Zygote.Zygote.FillArrays.AbstractFill)
+    val   = project.element(Zygote.Zygote.FillArrays.getindex_value(dx))
     nzVal = CUDA.fill(val, map(length, project.axes)...)
     CuSparseArrayCSR(copy(project.rowPtr), copy(project.colVal), nzVal, project.sz)
 end
 
-function (project::CRC.ProjectTo{CuSparseArrayCSR})(dx::AbstractArray)
-    # Raw nzVal array — wrap it with the reference structure
+function (project::CRC.ProjectTo{CuSparseArrayCSR})(dx::CuArray)
+    # CuArray tangent — must be nzVal-shaped; wrap with reference structure
     nzVal = project.element.(dx)
     CuSparseArrayCSR(copy(project.rowPtr), copy(project.colVal), nzVal, project.sz)
 end
-
-function (project::CRC.ProjectTo{CuSparseArrayCSR})(dx::CuArray)
-    nzVal = CUDA.zeros(typeof(project.element(one(Float32))), map(length, project.axes)...)
-    # dx is in Circulant space (ndims = nzVal_ndims + 1); drop the first dim
-    dx_nz = reshape(dx, size(nzVal, 1), size(dx)[2:end]...)
-    nzVal .= dx_nz
-    CuSparseArrayCSR(copy(project.rowPtr), copy(project.colVal), nzVal, project.sz)
-end
-
-similar_nzVal(project::CRC.ProjectTo{CuSparseArrayCSR}) =
-    CUDA.zeros(typeof(project.element(one(Float32))), map(length, project.axes)...)
 
 # ==============================================================================
 # CuSparseArrayCSR constructor rrule
@@ -124,22 +113,16 @@ function (project::CRC.ProjectTo{Circulant})(dx::CRC.AbstractZero)
     return dx
 end
 
-# Zygote.FillArrays.Fill — uniform scalar tangent (e.g. from sum(A) backprop).
+# Zygote.Zygote.FillArrays.Fill — uniform scalar tangent (e.g. from sum(A) backprop).
 # Delegate to embedded CSR projector which handles Fill → nzVal construction.
-function (project::CRC.ProjectTo{Circulant})(dx::Zygote.FillArrays.AbstractFill)
+function (project::CRC.ProjectTo{Circulant})(dx::Zygote.Zygote.FillArrays.AbstractFill)
     Circulant(project.data(dx), project.kernel_length, project.spatial_size)
 end
 
-function (project::CRC.ProjectTo{Circulant})(dx::CuArray)
-    Circulant(project.data(dx), project.kernel_length, project.spatial_size)
-end
-
-# Dense array — should not occur; error loudly
+# Dense array — route through ProjectTo{CuSparseArrayCSR} which handles
+# the conversion via its own AbstractArray handler.
 function (project::CRC.ProjectTo{Circulant})(dx::AbstractArray)
-    throw(ArgumentError(
-        "ProjectTo{Circulant} received a dense $(typeof(dx)) tangent. " *
-        "Ensure all operations on Circulant produce Circulant tangents."
-    ))
+    Circulant(project.data(dx), project.kernel_length, project.spatial_size)
 end
 
 # ==============================================================================
@@ -157,6 +140,8 @@ function CRC.rrule(::Type{Circulant}, data::A, M::Int, spatsize::NTuple{S,Int}) 
             ΔC.data
         elseif ΔC isa CRC.Tangent
             CRC.unthunk(ΔC.data)
+        elseif ΔC isa Zygote.FillArrays.AbstractFill
+            _concretize_tangent(ΔC, C).data
         else
             error("Unexpected tangent type for Circulant constructor: $(typeof(ΔC))")
         end
@@ -340,6 +325,105 @@ function CRC.rrule(::typeof(circulant_similarity), ::PIDistanceSimilarity, x::Ab
         return (CRC.NoTangent(), CRC.NoTangent(), ∂x, ∂y, CRC.NoTangent())
     end
     return S, pidist_sim_pullback
+end
+
+function CRC.rrule(::typeof(circulant_attention), A::Circulant{T, N, M}, b::AbstractArray{Tb,Nb}) where {T, N, M, Tb, Nb}
+    project_A = CRC.ProjectTo(A)
+    project_b = CRC.ProjectTo(b)
+    function circulant_attention_pullback(dc)
+        Δc = CRC.unthunk(dc)
+        ∂A = CRC.@thunk project_A(reshape(circulant_similarity(DotSimilarity(), Δc, b, M), size(A)...))
+        ∂b = CRC.@thunk begin
+            ΔC = reshape(Δc, :, size(Δc)[Nb-1:end]...)
+            ∂B = NNlib.batched_adjoint(reshape(A, :,:,:)) ⊠ ΔC
+            project_b(reshape(∂B, size(b)...))
+        end
+        return (CRC.NoTangent(), ∂A, ∂b)
+    end
+    return A ⊗ b, circulant_attention_pullback
+end
+
+function CRC.rrule(::typeof(circulant_transposed_attention), A::Circulant{T, N, M}, b::AbstractArray{Tb,Nb}) where {T, N, M, Tb, Nb}
+    project_A = CRC.ProjectTo(A)
+    project_b = CRC.ProjectTo(b)
+    function circulant_transposed_attention_pullback(dc)
+        Δc = CRC.unthunk(dc)
+        ∂A = CRC.@thunk project_A(reshape(circulant_similarity(DotSimilarity(), b, Δc, M), size(A)...))
+        ∂b = CRC.@thunk begin
+            ΔC = reshape(Δc, :, size(Δc)[Nb-1:end]...)
+            ∂B = reshape(A, :,:,:) ⊠ ΔC
+            project_b(reshape(∂B, size(b)...))
+        end
+        return (CRC.NoTangent(), ∂A, ∂b)
+    end
+    return circulant_transposed_attention(A, b), circulant_transposed_attention_pullback
+end
+
+# function CRC.rrule(::typeof(reshape), X::Circulant, dims::Union{Int,Colon}...)
+#     Y = reshape(X, dims...)
+#     function reshape_circulant_back(ΔY)
+#         raw = CRC.unthunk(ΔY)
+#         raw = raw isa Base.ReshapedArray ? parent(raw) : raw
+#         ∂X  = raw isa Circulant ? raw : _concretize_tangent(raw, X)
+#         return (CRC.NoTangent(), ∂X, ntuple(_->CRC.NoTangent(), length(dims))...)
+#     end
+#     return Y, reshape_circulant_back
+# end
+
+Zygote.@adjoint function Base.reshape(X::Circulant, dims::Union{Int,Colon}...)
+    Y = reshape(X, dims...)
+    function reshape_circulant_back(ΔY)
+        raw = CRC.unthunk(ΔY)
+        raw = raw isa Base.ReshapedArray ? parent(raw) : raw
+        raw = raw isa Circulant ? raw : _concretize_tangent(raw, Y)
+        ∂nzVal = reshape(raw.data.nzVal, size(X.data.nzVal))
+        ∂data  = CuSparseArrayCSR(copy(X.data.rowPtr), copy(X.data.colVal),
+                                   ∂nzVal, size(X.data))
+        ∂X = Circulant(∂data, kernel_length(X), spatial_size(X))
+        return (∂X, ntuple(_ -> nothing, length(dims))...)
+    end
+    return Y, reshape_circulant_back
+end
+
+# ==============================================================================
+# softmax rrule for Circulant
+#
+# NNlib's softmax falls back to scalar indexing on Circulant. We intercept and
+# run softmax in window (nzVal) space, then wrap the result back.
+# The pullback follows NNlib's own softmax pullback formula:
+#   ∂x = Y ⊙ (∂Y - sum(∂Y ⊙ Y; dims=dims))
+# where Y = softmax(X) and ⊙ is elementwise multiply.
+# ==============================================================================
+function CRC.rrule(::typeof(NNlib.softmax), X::Circulant; dims=1)
+    Y = NNlib.softmax(X) 
+    function softmax_circulant_back(ΔY)
+        ΔY  = _concretize_tangent(CRC.unthunk(ΔY), Y)
+        ΔYw = windowview(ΔY)
+        ∂Xw = NNlib.∇softmax_data(ΔYw, windowview(Y); dims)
+        return CRC.NoTangent(), _circ_from_window(∂Xw, X)
+    end
+    return Y, softmax_circulant_back
+end
+
+function CRC.rrule(::typeof(joint_softmax), As::Circulant...)
+    Ws      = map(windowview, As)
+    Wcat    = cat(Ws...; dims=1)
+    Scat    = NNlib.softmax(Wcat; dims=1)
+    sizes   = map(w -> size(w, 1), Ws)
+    offsets = cumsum((0, sizes...))
+    splits  = ntuple(i -> Scat[offsets[i]+1:offsets[i+1], ntuple(_->Colon(), ndims(Scat)-1)...], length(As))
+    results = ntuple(i -> _circ_from_window(splits[i], As[i]), length(As))
+
+    function joint_softmax_back(ΔYs)
+        ΔYs  = map(CRC.unthunk, ΔYs)
+        ΔYs  = ntuple(i -> _concretize_tangent(ΔYs[i], results[i]), length(As))
+        ΔWs  = map(windowview, ΔYs)
+        ΔScat = cat(ΔWs...; dims=1)
+        ΔWcat = NNlib.∇softmax_data(ΔScat, Scat; dims=1)
+        ∂As  = ntuple(i -> _circ_from_window(ΔWcat[offsets[i]+1:offsets[i+1], ntuple(_->Colon(), ndims(ΔWcat)-1)...], As[i]), length(As))
+        return CRC.NoTangent(), ∂As...
+    end
+    return results, joint_softmax_back
 end
 
 # ==============================================================================

@@ -189,24 +189,31 @@ end
 # Circulant constructor rrule handles the wrap. No custom softmax rrule needed.
 # ------------------------------------------------------------------------------
 
-function NNlib.softmax(A::Circulant{T,N,M}) where {T,N,M}
-    V = windowview(A)                          # (nnz_per_row, n_rows, batch...)
-    R = NNlib.softmax(V; dims=1)               # softmax over kernel dim
-    # Reconstruct: windowview shape → flat nzVal via constructor
-    # NNlib.softmax returns same shape as V; wrap back using Circulant constructor
-    # which copies rowPtr/colVal from A and uses R as the new nzVal window.
-    data = CuSparseArrayCSR(
-        copy(A.data.rowPtr), copy(A.data.colVal),
-        reshape(R, size(A.data.nzVal)...),
-        size(A)
-    )
-    return Circulant(data, M, spatial_size(A))
-end
+# function NNlib.softmax(A::Circulant{T,N,M}) where {T,N,M}
+#     V = windowview(A)                          # (nnz_per_row, n_rows, batch...)
+#     R = NNlib.softmax(V; dims=1)               # softmax over kernel dim
+#     # Reconstruct: windowview shape → flat nzVal via constructor
+#     # NNlib.softmax returns same shape as V; wrap back using Circulant constructor
+#     # which copies rowPtr/colVal from A and uses R as the new nzVal window.
+#     data = CuSparseArrayCSR(
+#         copy(A.data.rowPtr), copy(A.data.colVal),
+#         reshape(R, size(A.data.nzVal)...),
+#         size(A)
+#     )
+#     return Circulant(data, M, spatial_size(A))
+# end
+# 
+# function NNlib.softmax!(A::Circulant{T,N,M}, B::Circulant{T,N,M}=A) where {T,N,M}
+#     V = windowview(B)
+#     R = NNlib.softmax!(windowview(A), V; dims=1)
+#     return A
+# end
 
-function NNlib.softmax!(A::Circulant{T,N,M}, B::Circulant{T,N,M}=A) where {T,N,M}
-    V = windowview(B)
-    R = NNlib.softmax!(windowview(A), V; dims=1)
-    return A
+# Operates in window space; out is pre-allocated as a Circulant by softmax(x).
+function NNlib.softmax!(out::Circulant, x::Circulant; dims=1)
+    @assert dims==1
+    NNlib.softmax!(windowview(out), windowview(x); dims=dims)
+    return out
 end
 
 # ------------------------------------------------------------------------------
@@ -226,5 +233,22 @@ end
 Equivalent to `softmax(circulant_similarity(simfun, x, y, W))`.
 """
 function circulant_adjacency(simfun::AbstractSimilarity, x, y, W::Integer)
-    circulant_similarity(simfun, x, y, W) |> NNlib.softmax
+    NNlib.softmax(circulant_similarity(simfun, x, y, W))
+end
+
+function joint_softmax(As::Circulant...)
+    Ws   = map(windowview, As)
+    Wcat = cat(Ws...; dims=1)               # (sum(nnz_per_row), n_rows, ch..., batch)
+    Scat = NNlib.softmax(Wcat; dims=1)      # normalize jointly across kernel dim
+    sizes = map(w -> size(w, 1), Ws)        # nnz_per_row for each input
+    splits = _split_first_dim(Scat, sizes)
+    return map((S, A) -> _circ_from_window(S, A), splits, As)
+end
+
+# Split array along dim 1 at the given sizes.
+function _split_first_dim(W::CuArray, sizes)
+    offsets = cumsum((0, sizes...))
+    ntuple(length(sizes)) do i
+        W[offsets[i]+1:offsets[i+1], ntuple(_->Colon(), ndims(W)-1)...]
+    end
 end

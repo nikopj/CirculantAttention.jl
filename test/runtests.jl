@@ -17,7 +17,7 @@ ChainRulesCore.debug_mode() = true
 
 TEST_ELTYPES = (Float32,ComplexF32,)
 TEST_SPATDIMS = (1,2,)
-
+ 
 include("utils.jl")
 
 @testset "CirculantAttention.jl" begin

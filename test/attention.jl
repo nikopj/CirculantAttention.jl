@@ -153,5 +153,19 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         end
     end
 
+    if elty == Float32
+        @testset "joint_softmax rrule [$tag]" begin
+            for K in [2,]
+                circs = ntuple(_ -> make_circulant(elty, spatdims, rand((3,5,7)), B), K)
+                ΔAs   = ntuple(i -> rand_tangent(circs[i]), K)
+                ΔYs   = ntuple(i -> rand_tangent(joint_softmax(circs...)[i]), K)
+                test_rrule(
+                    joint_softmax, map((c, Δ) -> c ⊢ Δ, circs, ΔAs)...;
+                    output_tangent=ΔYs, rtol=1e-3, atol=1e-5, check_inferred=false,
+                )
+            end
+        end
+    end
+
 end
 end

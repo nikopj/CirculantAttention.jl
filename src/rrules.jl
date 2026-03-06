@@ -415,6 +415,7 @@ function CRC.rrule(::typeof(joint_softmax), As::Circulant...)
     results = ntuple(i -> _circ_from_window(splits[i], As[i]), length(As))
 
     function joint_softmax_back(ΔYs)
+        ΔYs  = CRC.unthunk(ΔYs)
         ΔYs  = map(CRC.unthunk, ΔYs)
         ΔYs  = ntuple(i -> _concretize_tangent(ΔYs[i], results[i]), length(As))
         ΔWs  = map(windowview, ΔYs)

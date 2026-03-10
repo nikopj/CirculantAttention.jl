@@ -178,37 +178,6 @@ function circulant_similarity_kernel!(
     return nothing
 end
 
-# ------------------------------------------------------------------------------
-# Softmax over circulant rows.
-#
-# circulant_softmax uses windowview to expose nzVal as (nnz_per_row, n_rows, batch...),
-# applies NNlib.softmax over dim=1 (the within-row / kernel dim), then wraps the
-# result back into a Circulant via the constructor.
-#
-# This is fully AD-traceable: NNlib.softmax has a ChainRules rrule, and the
-# Circulant constructor rrule handles the wrap. No custom softmax rrule needed.
-# ------------------------------------------------------------------------------
-
-# function NNlib.softmax(A::Circulant{T,N,M}) where {T,N,M}
-#     V = windowview(A)                          # (nnz_per_row, n_rows, batch...)
-#     R = NNlib.softmax(V; dims=1)               # softmax over kernel dim
-#     # Reconstruct: windowview shape → flat nzVal via constructor
-#     # NNlib.softmax returns same shape as V; wrap back using Circulant constructor
-#     # which copies rowPtr/colVal from A and uses R as the new nzVal window.
-#     data = CuSparseArrayCSR(
-#         copy(A.data.rowPtr), copy(A.data.colVal),
-#         reshape(R, size(A.data.nzVal)...),
-#         size(A)
-#     )
-#     return Circulant(data, M, spatial_size(A))
-# end
-# 
-# function NNlib.softmax!(A::Circulant{T,N,M}, B::Circulant{T,N,M}=A) where {T,N,M}
-#     V = windowview(B)
-#     R = NNlib.softmax!(windowview(A), V; dims=1)
-#     return A
-# end
-
 # Operates in window space; out is pre-allocated as a Circulant by softmax(x).
 function NNlib.softmax!(out::Circulant, x::Circulant; dims=1)
     @assert dims==1

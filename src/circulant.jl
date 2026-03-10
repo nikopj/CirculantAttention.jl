@@ -117,3 +117,6 @@ function cucirculant(M::Int, N1::Int, N2::Int, Tv=Float32, Ti=Int32)
     kernel(args...; threads=threads, blocks=blocks)
     return CuSparseMatrixCSR{Tv, Ti}(rowptr, colval, nzval, (N1*N2, N1*N2))
 end
+
+CRC.@non_differentiable cucirculant(::Any...)
+Zygote.@nograd cucirculant

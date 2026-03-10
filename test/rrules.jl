@@ -157,6 +157,38 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         @test all(≈(c;     atol=1e-4), nz_cpu(gs[2]))
     end
 
+    # --------------------------------------------------------
+    # 16. sparsemax, entmax
+    # --------------------------------------------------------
+    @testset "sparsemax [$tag]" begin
+        W = windowview(real(A))
+        ΔW = similar(W); CUDA.randn!(ΔW)
+        V = similar(W); CUDA.randn!(V)
+        test_rrule(sparsemax, W ⊢ ΔW, output_tangent=V,
+            rtol=1e-3, atol=1e-3, check_inferred=false,
+        )
+    end
+
+    @testset "entmax, α scalar [$tag]" begin
+        W = windowview(real(A))
+        ΔW = similar(W); CUDA.randn!(ΔW)
+        V = similar(W); CUDA.randn!(V)
+        test_rrule(entmax, W ⊢ ΔW, 1.5f0 ⊢ (1f0 + rand()), output_tangent=V,
+            rtol=1e-3, atol=1e-3, check_inferred=false,
+        )
+    end
+
+    @testset "entmax, α array [$tag]" begin
+        α  = 1f0 .+ CUDA.rand(Float32, 1, 1, 2, 1)
+        W  = windowview(real(A .* α))
+        ΔW = similar(W); CUDA.randn!(ΔW)
+        V  = similar(W); CUDA.randn!(V)
+        Δα = CUDA.rand(Float32, 1, 1, 2, 1)
+        test_rrule(entmax, W ⊢ ΔW, α ⊢ Δα, output_tangent=V,
+            rtol=1e-3, atol=1e-3, check_inferred=false,
+        )
+    end
+
 end  # for elty, nspatdims
 
 end  # @testset

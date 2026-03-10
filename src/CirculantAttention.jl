@@ -9,7 +9,6 @@ import Adapt
 
 using SparseArrays
 using LinearAlgebra
-using KernelAbstractions.Extras: @unroll
 
 using NNlib
 import ChainRulesCore as CRC
@@ -25,6 +24,14 @@ include("similarity.jl")
 export circulant_similarity, circulant_similarity!
 export DotSimilarity, RealDotSimilarity, DistanceSimilarity, PIDotSimilarity, PIDistanceSimilarity
 export circulant_adjacency, circulant_adjacency!
+
+include("topk.jl")
+include("sparsemax.jl")
+include("entmax.jl")
+export TopKSimilarity
+export SparsemaxSimilarity, EntmaxSimilarity
+export sparsemax, entmax
+export joint_sparsemax, joint_entmax
 
 include("attention.jl")
 export joint_softmax

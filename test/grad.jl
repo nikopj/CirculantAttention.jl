@@ -54,7 +54,14 @@ end
 
 @testset "DNN-Style Gradients" begin 
 for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS, 
-    simfun in (RealDotSimilarity(), DistanceSimilarity(), PIDotSimilarity(), PIDistanceSimilarity())
+    simfun in (RealDotSimilarity(), 
+               DistanceSimilarity(), 
+               PIDotSimilarity(), 
+               PIDistanceSimilarity(), 
+               # TopKSimilarity(PIDistanceSimilarity(), _windowsize-1), 
+               SparsemaxSimilarity(RealDotSimilarity()),
+               EntmaxSimilarity(RealDotSimilarity(), 1.5f0),
+              )
 
     tag = "elty=$elty, nspatdims=$nspatdims, simfun=$simfun"
 
@@ -157,17 +164,24 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS,
     W1 = 3
     W2 = 5
 
+    jnorm_fun = if simfun isa SparsemaxSimilarity
+        joint_sparsemax
+    elseif simfun isa EntmaxSimilarity
+        (As...) -> joint_entmax(simfun.α, As...)
+    else
+        joint_softmax
+    end
+
     function loss(x, y, z)
         A1 = circulant_similarity(simfun, x, y, W1)
         A2 = circulant_similarity(simfun, x, z, W2)
-        S1, S2 = joint_softmax(real(A1), real(A2))
+        S1, S2 = jnorm_fun(real(A1), real(A2))
         # Weighted aggregation with both attention maps
         sum(abs2, (S1 ⊗ y) .+ (S2 ⊗ z))
     end
 
-    val, gs = Zygote.withgradient(loss, x, y, z)
-
-    @testset "joint_softmax loss [$tag]" begin
+    @testset "joint_normalization loss [$tag]" begin
+        val, gs = Zygote.withgradient(loss, x, y, z)
         @test isfinite(val)
         for (i, g) in enumerate(gs)
             @test !isnothing(g) 

@@ -70,7 +70,7 @@ function joint_entmax(α, As::Circulant...)
 end
 
 function _entmax_pullback_z(Δp::AbstractArray, p::AbstractArray, W::AbstractArray, α)
-    mask    = p .> zero(eltype(p))
+    mask    = p .> sqrt(eps(eltype(p)))
     w       = ifelse.(mask, p .^ (2f0 .- α), zero(eltype(p)))   # p_i^(2-α)
     W_sum   = sum(w; dims=1)
     # Weighted upstream sum: sum_{i∈S} Δp_i * w_i
@@ -83,7 +83,7 @@ function _entmax_pullback_z(Δp::AbstractArray, p::AbstractArray, W::AbstractArr
 end
 
 function _entmax_pullback_α(Δp::CuArray, p::CuArray, W::CuArray, α)
-    mask  = p .> zero(eltype(p))
+    mask    = p .> sqrt(eps(eltype(p)))
     w     = ifelse.(mask, p .^ (2f0 .- α), zero(eltype(p)))   # p_i^(2-α)
     W_sum = sum(w; dims=1)
     logp  = ifelse.(mask, log.(p .+ _ENTMAX_EPS), zero(eltype(p)))

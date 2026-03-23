@@ -211,26 +211,29 @@ end
 # Batch-dim reduction preserves Circulant structure; rowPtr/colVal selection
 # via getindex is opaque, so we need this explicit rule.
 # ==============================================================================
-
 function CRC.rrule(::typeof(Base.sum), A::Circulant{T,N,M}; dims=:) where {T,N,M}
-    @assert dims != Colon() && all(collect(dims) .> 2) """
-        sum rrule for Circulant only supports batch dims (dims > 2).
-        For full reduction use sum(A.data.nzVal) directly.
-    """
     project_A   = CRC.ProjectTo(A)
     project_csr = CRC.ProjectTo(A.data)
-    result = sum(A; dims=dims)
+    result      = sum(A; dims=dims)
+
     function sum_pullback(Δ)
         Δ = CRC.unthunk(Δ)
-        # Extract nzVal (size-1 in summed dims) from whatever tangent type arrives
-        δ_nzVal = Δ isa Circulant   ? Δ.data.nzVal :
-                  Δ isa CRC.Tangent ? CRC.unthunk(Δ.data).nzVal :
-                  error("Unexpected tangent type in sum_pullback: $(typeof(Δ))")
-        # Broadcast size-1 summed dims back to full nzVal shape
-        ∂nzVal = δ_nzVal .+ CUDA.zeros(T, size(A.data.nzVal)...)
-        ∂data  = project_csr(CuSparseArrayCSR(copy(A.data.rowPtr), copy(A.data.colVal), ∂nzVal, size(A)))
+
+        if dims === Colon()
+            # Full reduction: Δ is a scalar, broadcast to full nzVal shape
+            ∂nzVal = CUDA.fill(T(Δ), size(A.data.nzVal)...)
+        else
+            # Batch dims reduction: Δ is a Circulant with size-1 in summed dims
+            δ_nzVal = Δ isa Circulant      ? Δ.data.nzVal :
+                      Δ isa CRC.Tangent    ? CRC.unthunk(Δ.data).nzVal :
+                      error("Unexpected tangent type in sum_pullback: $(typeof(Δ))")
+            ∂nzVal = δ_nzVal .+ CUDA.zeros(T, size(A.data.nzVal)...)
+        end
+
+        ∂data = project_csr(CuSparseArrayCSR(copy(A.data.rowPtr), copy(A.data.colVal), ∂nzVal, size(A)))
         return CRC.NoTangent(), project_A(Circulant(∂data, M, spatial_size(A)))
     end
+
     return result, sum_pullback
 end
 

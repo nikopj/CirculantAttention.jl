@@ -5,6 +5,7 @@ export CircAtt
 
 using CUDA, CUDA.CUSPARSE, cuDNN
 using CUDA: i32
+using GPUArrays
 import Adapt
 
 using SparseArrays

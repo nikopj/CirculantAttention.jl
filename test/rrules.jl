@@ -1,6 +1,6 @@
-# @testset "Low-level Circulant rrules" begin
+@testset "Low-level Circulant rrules" begin
 
-# for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
+for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
     ws    = 3
     batch = 2
     spatdims = ntuple(_ -> 8, nspatdims)
@@ -59,8 +59,8 @@
 
     @testset "Broadcast .* same shape [$tag]" begin
         gs = Zygote.gradient((a, b) -> sum(real.((a .* b))), A, B)
-        @test nz_cpu(gs[1]) ≈ nzB  rtol=1e-3
-        @test nz_cpu(gs[2]) ≈ nzA  rtol=1e-3
+        @test nz_cpu(gs[1]) ≈ conj(nzB)  rtol=1e-3
+        @test nz_cpu(gs[2]) ≈ conj(nzA)  rtol=1e-3
     end
 
     @testset "Broadcast .+ same shape [$tag]" begin
@@ -87,21 +87,29 @@
 
     # --------------------------------------------------------
     # 10. CuArray .* Circulant (replaces scale)
-    #     ∂c[b] = sum(nzVal for batch b),  ∂A.nzVal[i,b] = c[b]
+    #     c has shape (1,1,...,batch) — one scalar per batch element.
+    #     ∂c[b] = sum of A's nzVals for batch b  (chain rule: ∂(c*nz)/∂c = nz)
+    #     ∂A.nzVal[i,b] = c[b]                   (chain rule: ∂(c*nz)/∂nz = c)
     # --------------------------------------------------------
     @testset "CuArray .* Circulant (batch scale) [$tag]" begin
-        nzval_dim = ndims(A.data.nzVal)
+        # c: one scalar per batch, broadcast over all spatial/channel dims
         c     = CUDA.randn(real(elty), ntuple(_ -> 1, ndims(A) - 1)..., batch)
-        @warn size(c .* A)
-        gs    = Zygote.gradient((c, a) -> sum(real.((c .* a))), c, A)
-        ∂c    = Array(gs[1])
-        ∂A_nz = nz_cpu(gs[2])
         c_cpu = Array(c)
+        gs    = Zygote.gradient((c, a) -> sum(real.(c .* a)), c, A)
+        ∂c    = Array(gs[1])       # same shape as c: (1,1,...,batch)
+        ∂A_nz = nz_cpu(gs[2])      # same shape as nzVal: (nnz, batch...)
+
+        # nzVal last dim and c last dim both index batch
+        nz_last = ndims(∂A_nz)
+        c_last  = ndims(∂c)
 
         for b in 1:batch
-            c_b = real(selectdim(c_cpu, nzval_dim, b)[])
-            @test selectdim(∂c,    nzval_dim, b)[] ≈ sum(real.(selectdim(nzA, nzval_dim, b)))  rtol=1e-3
-            @test all(≈(c_b; rtol=1e-3), selectdim(∂A_nz, nzval_dim, b))
+            c_b        = real(selectdim(c_cpu, c_last,  b)[])
+            nzA_b      = real.(selectdim(nzA,  nz_last, b))
+            # ∂c[b] accumulates gradients from every nzVal entry in batch b
+            @test selectdim(∂c, c_last, b)[] ≈ sum(nzA_b)  rtol=1e-3
+            # every nzVal entry in batch b receives the same gradient c[b]
+            @test all(≈(c_b; rtol=1e-3), selectdim(∂A_nz, nz_last, b))
         end
     end
 
@@ -149,6 +157,38 @@
         @test all(≈(c;     atol=1e-4), nz_cpu(gs[2]))
     end
 
-# end  # for elty, nspatdims
+    # --------------------------------------------------------
+    # 16. sparsemax, entmax
+    # --------------------------------------------------------
+    @testset "sparsemax [$tag]" begin
+        W = windowview(real(A))
+        ΔW = similar(W); CUDA.randn!(ΔW)
+        V = similar(W); CUDA.randn!(V)
+        test_rrule(sparsemax, W ⊢ ΔW, output_tangent=V,
+            rtol=1e-3, atol=1e-3, check_inferred=false,
+        )
+    end
 
-# end  # @testset
+    @testset "entmax, α scalar [$tag]" begin
+        W = windowview(real(A))
+        ΔW = similar(W); CUDA.randn!(ΔW)
+        V = similar(W); CUDA.randn!(V)
+        test_rrule(entmax, W ⊢ ΔW, 1.5f0 ⊢ (1f0 + rand()), output_tangent=V,
+            rtol=1e-3, atol=1e-3, check_inferred=false,
+        )
+    end
+
+    @testset "entmax, α array [$tag]" begin
+        α  = 1f0 .+ CUDA.rand(Float32, 1, 1, 2, 1)
+        W  = windowview(real(A .* α))
+        ΔW = similar(W); CUDA.randn!(ΔW)
+        V  = similar(W); CUDA.randn!(V)
+        Δα = CUDA.rand(Float32, 1, 1, 2, 1)
+        test_rrule(entmax, W ⊢ ΔW, α ⊢ Δα, output_tangent=V,
+            rtol=1e-3, atol=1e-3, check_inferred=false,
+        )
+    end
+
+end  # for elty, nspatdims
+
+end  # @testset

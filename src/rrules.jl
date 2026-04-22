@@ -238,6 +238,45 @@ function CRC.rrule(::typeof(Base.sum), A::Circulant{T,N,M}; dims=:) where {T,N,M
 end
 
 # ==============================================================================
+# cat rrule (batch dims 3 or 4 only)
+#
+# Concatenation of CuSparseArrayCSR manipulates rowPtr/colVal structurally,
+# which is opaque to Zygote. Pullback splits the incoming tangent's nzVal
+# along the corresponding nzVal dim (circ_dim - 1) into chunks matching
+# each input's size, then wraps each chunk back into a Circulant.
+# ==============================================================================
+
+function CRC.rrule(::typeof(Base.cat), As::Circulant{T,N,M}...; dims=3) where {T,N,M}
+    @assert dims == 3 || dims == 4 "cat rrule only supports dims=3 or dims=4"
+    @assert dims <= N "cat dim $dims exceeds ndims=$N"
+
+    Y         = cat(As...; dims=dims)
+    projects  = map(CRC.ProjectTo, As)
+    nzval_dim = dims - 1                    # Circulant dim k → nzVal dim k-1
+    sizes     = map(A -> size(A.data.nzVal, nzval_dim), As)
+    offsets   = cumsum((0, sizes...))
+
+    function cat_pullback(ΔY)
+        ΔY     = CRC.unthunk(ΔY)
+        ΔY     = _concretize_tangent(ΔY, Y)
+        ΔnzVal = ΔY.data.nzVal
+
+        ∂As = ntuple(length(As)) do i
+            A  = As[i]
+            # Select chunk along nzval_dim corresponding to input i
+            idx   = ntuple(d -> d == nzval_dim ? (offsets[i]+1:offsets[i+1]) : Colon(), ndims(ΔnzVal))
+            chunk = ΔnzVal[idx...]
+            ∂data = CuSparseArrayCSR(copy(A.data.rowPtr), copy(A.data.colVal), chunk, size(A))
+            projects[i](Circulant(∂data, M, spatial_size(A)))
+        end
+
+        return CRC.NoTangent(), ∂As...
+    end
+
+    return Y, cat_pullback
+end
+
+# ==============================================================================
 # circulant_similarity rrules
 #
 # All variants call @cuda kernels — Zygote cannot trace through.

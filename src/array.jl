@@ -24,12 +24,12 @@ function Adapt.adapt_structure(to, A::Circulant{T, N, M}) where {T, N, M}
     Circulant(Adapt.adapt_structure(to, A.data), M, A.spatial_size)
 end
 
-function Adapt.adapt_structure(to::CUDA.KernelAdaptor, A::CuSparseArrayCSR{T,Ti,N}) where {T,Ti,N}
-    rowPtr = Adapt.adapt(to, A.rowPtr)
-    colVal = Adapt.adapt(to, A.colVal)
-    nzVal  = Adapt.adapt(to, A.nzVal)
-    GPUArrays.GPUSparseDeviceArrayCSR{T, Ti, typeof(rowPtr), typeof(nzVal), N, N-1, 1}(rowPtr, colVal, nzVal, size(A), Ti(length(A.nzVal)))
-end
+# function Adapt.adapt_structure(to::CUDA.KernelAdaptor, A::CuSparseArrayCSR{T,Ti,N}) where {T,Ti,N}
+#     rowPtr = Adapt.adapt(to, A.rowPtr)
+#     colVal = Adapt.adapt(to, A.colVal)
+#     nzVal  = Adapt.adapt(to, A.nzVal)
+#     GPUArrays.GPUSparseDeviceArrayCSR{T, Ti, typeof(rowPtr), typeof(nzVal), N, N-1, 1}(rowPtr, colVal, nzVal, size(A), Ti(length(A.nzVal)))
+# end
 
 CUDA.unsafe_free!(A::Circulant) = CUDA.unsafe_free!(A.data)
 

@@ -85,6 +85,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         @test nz_cpu(gs[1]) ≈ fill(real(elty)(-batch), size(A1.data.nzVal)...)  rtol=1e-3
     end
 
+
     # --------------------------------------------------------
     # 10. CuArray .* Circulant (replaces scale)
     #     c has shape (1,1,...,batch) — one scalar per batch element.
@@ -144,6 +145,19 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         test_rrule(
             Base.repeat, A ⊢ ΔA, reps...;
             output_tangent=ΔArep, rtol=1e-3, atol=1e-5, check_inferred=false,
+        )
+    end
+
+    # --------------------------------------------------------
+    # 14b. cat rrule (batch dim)
+    # --------------------------------------------------------
+    @testset "cat (batch dim) [$tag]" begin
+        Acat  = cat(A, B; dims=ndims(A))
+        ΔAcat = rand_tangent(Acat)
+        test_rrule(
+            Base.cat, A ⊢ ΔA, B ⊢ ΔB;
+            fkwargs=(dims=ndims(A),), output_tangent=ΔAcat,
+            rtol=1e-3, atol=1e-5, check_inferred=false,
         )
     end
 

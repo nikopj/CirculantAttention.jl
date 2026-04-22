@@ -65,6 +65,9 @@ date = string(Dates.now())
 dev_name = CUDA.name(CUDA.device())
 
 for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsize in 5:10:45
+    H, W, C, B = tensorsize
+    N = H*W
+
     for _ in 1:3 # warmup
         global x, y, A
         x, y, A = make_data(elty, tensorsize, windowsize)
@@ -72,22 +75,28 @@ for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsiz
 
     # similarity
     t = bench_gpu(() -> circulant_similarity(DistanceSimilarity(), x, y, windowsize))
-    flops = tensorsize[4] * tensorsize[1] * tensorsize[2] * (2*tensorsize[3] - 1) * (windowsize^2)
+    flops = B * N * (2*C - 1) * (windowsize^2)
     gf = flops / (t / 1e3) / 1e9
     push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_similarity", t, gf))
 
     # attention
     t = bench_gpu(() -> circulant_attention(A, x))
-    flops = tensorsize[4] * tensorsize[1] * tensorsize[2] * tensorsize[3] * (2*windowsize^2 - 1)
+    flops = B * N * C * (2*windowsize^2 - 1)
     gf = flops / (t / 1e3) / 1e9
     push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_attention", t, gf))
 
     # softmax
     t = bench_gpu(() -> NNlib.softmax(A))
-    flops = tensorsize[4] * tensorsize[1] * tensorsize[2] * tensorsize[3] * 15 * (2*windowsize^2 - 1 + 1) # 15 bc exp, +1 bc division in softmax
+    flops = B * N * C * 15 * (2*windowsize^2 - 1 + 1) # 15 bc exp, +1 bc division in softmax
     gf = flops / (t / 1e3) / 1e9
     push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "softmax", t, gf))
+
+    # joint softmax
+    t = bench_gpu(() -> CircAtt.joint_softmax(A, A))
+    flops = B * N * C * 15 * (2 * 2*windowsize^2 - 1 + 1) # 15 bc exp, +1 bc division in softmax
+    gf = flops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "joint_softmax", t, gf))
 end
 
-# CSV.write("benchmark/benchmark_results.csv", results; append=true)
-# println("Saved benchmark_results.csv")
+CSV.write("benchmark/benchmark_results.csv", results; append=true)
+println("Saved benchmark_results.csv")

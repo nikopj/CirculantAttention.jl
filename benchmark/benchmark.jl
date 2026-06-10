@@ -1,6 +1,7 @@
 using CUDA
 using BenchmarkTools
 using NNlib
+using Zygote
 using CirculantAttention
 using CSV
 using DataFrames
@@ -84,6 +85,26 @@ for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsiz
     flops = B * N * C * (2*windowsize^2 - 1)
     gf = flops / (t / 1e3) / 1e9
     push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_attention", t, gf))
+
+    # end-to-end: composed pipeline (similarity → softmax → ⊠) vs fused flash kernel
+    flops = B * N * (2*C - 1) * (windowsize^2) + B * N * C * (2*windowsize^2 - 1)
+    t = bench_gpu(() -> circulant_attention(DistanceSimilarity(), x, y, x, windowsize))
+    gf = flops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_attention_pipeline", t, gf))
+
+    t = bench_gpu(() -> circulant_flash_attention(DistanceSimilarity(), x, y, x, windowsize))
+    gf = flops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_flash_attention", t, gf))
+
+    # forward + backward: composed vs fused gradients (nominal flops ≈ 3x forward)
+    gradflops = 3 * flops
+    t = bench_gpu(() -> Zygote.gradient((q, k, v) -> sum(abs2, first(circulant_attention(DistanceSimilarity(), q, k, v, windowsize))), x, y, x))
+    gf = gradflops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_attention_gradient", t, gf))
+
+    t = bench_gpu(() -> Zygote.gradient((q, k, v) -> sum(abs2, circulant_flash_attention(DistanceSimilarity(), q, k, v, windowsize)), x, y, x))
+    gf = gradflops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_flash_attention_gradient", t, gf))
 
     # softmax
     t = bench_gpu(() -> NNlib.softmax(A))

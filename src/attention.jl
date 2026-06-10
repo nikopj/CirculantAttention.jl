@@ -38,10 +38,10 @@ See also [`circulant_attention`](@ref), [`DotSimilarity`](@ref), [`DistanceSimil
 """
 function circulant_mh_attention(simfun::AbstractSimilarity, q::T, k::T, v::T, W::Int, nheads::Int) where {Tv, N, T<: AbstractArray{Tv,N}}
     qr, kr, vr = splitheads.((q, k, v), nheads)
-    yr, A = circulant_attention(qr, kr, vr, W)
+    yr, A = circulant_attention(simfun, qr, kr, vr, W)
     return reshape(yr, size(q)...), reshape(A, :, :, nheads, size(q, N))
 end
-circulant_mh_attention(q::T, k::T, v::T, W::Int, nheads::Int) where T = circulant_attention(DotSimilarity(), q, k, v, W, nheads)
+circulant_mh_attention(q::T, k::T, v::T, W::Int, nheads::Int) where T = circulant_mh_attention(DotSimilarity(), q, k, v, W, nheads)
 splitheads(x::AbstractArray{T,N}, nheads) where {T,N} = reshape(x, ntuple(i->size(x,i), N-2)..., size(x, N-1) ÷ nheads, :)
 
 function circulant_mh_adjacency(simfun, x::AbstractArray{T,N}, y, W::Integer, nheads::Int) where {T, N}

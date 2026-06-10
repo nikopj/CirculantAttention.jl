@@ -166,8 +166,11 @@ function circulant_similarity_kernel!(
         b = (tid - Int32(1)) ÷ nnzb + Int32(1)
 
         i, j = cartesian_circulant(n, spatdims, W)
+        # nzVal[n] sits at CSR (row j, col i): x is indexed by the row and y by
+        # the column (S[j,i] = simval(x_j, y_i)), matching the rrules in
+        # rrules.jl and the docstring S_ij = simfun(q_i, k_j).
         Ci, Cj = CartInd[i], CartInd[j]
-        s = simval(simfun, x, y, Ci, Cj, b, M)
+        s = simval(simfun, x, y, Cj, Ci, b, M)
 
         S.data.nzVal[n, b] = s
         tid += stride

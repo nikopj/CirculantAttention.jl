@@ -201,3 +201,25 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
 
 end
 end
+
+# Regression: circulant_mh_attention must respect the simfun argument
+# (it previously always used DotSimilarity), and the default-simfun
+# convenience method must dispatch correctly.
+@testset "circulant_mh_attention simfun" begin
+    q = CUDA.randn(Float32, 8, 8, 4, 2)
+    k = CUDA.randn(Float32, 8, 8, 4, 2)
+    v = CUDA.randn(Float32, 8, 8, 4, 2)
+    ws, nheads = 5, 2
+
+    qr, kr, vr = CircAtt.splitheads.((q, k, v), nheads)
+    y_ref, _ = circulant_attention(DistanceSimilarity(), qr, kr, vr, ws)
+    y_mh, _  = circulant_mh_attention(DistanceSimilarity(), q, k, v, ws, nheads)
+    @test Array(y_mh) ≈ Array(reshape(y_ref, size(q)...))  rtol=1e-4
+
+    y_dot, _ = circulant_mh_attention(DotSimilarity(), q, k, v, ws, nheads)
+    @test !(Array(y_mh) ≈ Array(y_dot))
+
+    # default simfun is DotSimilarity
+    y_def, _ = circulant_mh_attention(q, k, v, ws, nheads)
+    @test Array(y_def) ≈ Array(y_dot)
+end

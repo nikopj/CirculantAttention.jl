@@ -25,5 +25,6 @@ include("utils.jl")
     include("array.jl")
     include("rrules.jl")
     include("attention.jl")
+    include("flash.jl")
     include("grad.jl")
 end

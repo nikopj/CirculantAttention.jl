@@ -38,6 +38,9 @@ include("attention.jl")
 export joint_softmax
 export circulant_attention, circulant_mh_attention, circulant_mh_adjacency, ⊗, ⨷ # \otimes and \Otimes
 
+include("flash.jl")
+export circulant_flash_attention, circulant_mh_flash_attention
+
 include("batchedmul.jl")
 
 include("rrules.jl")

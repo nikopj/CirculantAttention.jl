@@ -118,6 +118,21 @@ u = B ⊗ v # \otimes, equivalent to u = circulant_attention(A, v)
 u ≈ y     # true
 ```
 
+### Flash attention
+When the adjacency matrix `A` is not needed, `circulant_flash_attention` fuses
+similarity, softmax, and application of the attention matrix into a single
+kernel with an online softmax — the circulant-sparse matrix is never
+materialized, reducing memory traffic from $O(NW^d)$ to $O(NC)$
+([FlashAttention](https://arxiv.org/abs/2205.14135)-style). It is fully
+differentiable with a fused backward pass as well: attention weights are
+recomputed on the fly from the logsumexp saved during the forward pass, so no
+sparse intermediate exists in either direction.
+```julia
+y2 = circulant_flash_attention(DistanceSimilarity(), q, k, v, ws)
+y2 ≈ y # true
+y3 = circulant_mh_flash_attention(DistanceSimilarity(), q, k, v, ws, nheads)
+```
+
 We can additionally perform multi-head attention,
 ```julia
 y, A = circulant_mh_attention(DotSimilarity(), q, k, v, ws, nheads) 

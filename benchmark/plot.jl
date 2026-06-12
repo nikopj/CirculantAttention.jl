@@ -5,6 +5,14 @@ using StatsPlots
 df = CSV.read("benchmark/benchmark_results.csv", DataFrame, header=false)
 rename!(df, [:commit, :timestamp, :gpu_name, :dtype, :shape, :windowsize, :function_name, :time_ms, :gflops])
 
+# Log-scale bar plots need a positive lower y-limit (bars are drawn from 0,
+# which is -Inf in log space); pad to the surrounding decades.
+function log_ylims(tmat)
+    finite = filter(x -> !isnan(x) && x > 0, vec(collect(Float64, tmat)))
+    isempty(finite) && return (1e-2, 1e2)
+    return (10.0^floor(log10(minimum(finite) / 1.2)), 10.0^ceil(log10(maximum(finite) * 1.2)))
+end
+
 # Filter for circulant_similarity and Float32 only
 filtered = filter(row -> row.function_name == "circulant_similarity" && row.dtype == "Float32", df)
 
@@ -26,6 +34,12 @@ groupedbar(window_sizes, time_matrix,
     bar_width=4,
     xticks=window_sizes,
     legend=:topleft,
+    yscale=:log10,
+    ylims=log_ylims(time_matrix),
+    grid=true,
+    minorgrid=true,
+    gridalpha=0.4,
+    minorgridalpha=0.15,
 )
 
 savefig("benchmark/circulant_similarity_float32.png")
@@ -51,6 +65,12 @@ groupedbar(window_sizes, time_matrix,
     bar_width=4,
     xticks=window_sizes,
     legend=:topleft,
+    yscale=:log10,
+    ylims=log_ylims(time_matrix),
+    grid=true,
+    minorgrid=true,
+    gridalpha=0.4,
+    minorgridalpha=0.15,
 )
 
 savefig("benchmark/circulant_attention_float32.png")
@@ -87,13 +107,18 @@ function comparison_plot(df, impls, impl_labels, titlestr, outprefix)
             bar_width=4,
             xticks=wsizes,
             legend=:topleft,
+            yscale=:log10,
+            ylims=log_ylims(tmat),
+            grid=true,
+            minorgrid=true,
+            gridalpha=0.4,
+            minorgridalpha=0.15,
         )
-
         savefig("benchmark/$(outprefix)_$(lowercase(dtype)).png")
     end
 end
 
-# forward, single-head
+                                                                                                                                           # forward, single-head
 comparison_plot(df,
     ["circulant_attention_pipeline", "circulant_flash_attention", "circulant_flash_attention_thread"],
     ["standard" "flash" "flash (thread)"],
@@ -109,8 +134,7 @@ comparison_plot(df,
 
 # forward, multi-head (nheads=4)
 comparison_plot(df,
-    ["circulant_mh_attention_pipeline", "circulant_mh_flash_attention"],
-    ["standard" "flash"],
+    ["circulant_mh_attention_pipeline", "circulant_mh_flash_attention"],    ["standard" "flash"],
     "multi-head forward: standard vs flash",
     "flash_mh_comparison")
 
@@ -120,3 +144,16 @@ comparison_plot(df,
     ["standard" "flash"],
     "multi-head forward+backward: standard vs flash",
     "flash_mh_gradient_comparison")
+
+# joint-softmax attention over windows (5, windowsize)
+comparison_plot(df,
+    ["circulant_joint_attention_pipeline", "circulant_flash_joint_attention"],
+    ["standard" "flash"],
+    "joint-softmax forward: standard vs flash",
+    "flash_joint_comparison")
+
+comparison_plot(df,
+    ["circulant_joint_attention_gradient", "circulant_flash_joint_attention_gradient"],
+    ["standard" "flash"],
+    "joint-softmax forward+backward: standard vs flash",
+    "flash_joint_gradient_comparison")

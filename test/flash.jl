@@ -106,6 +106,49 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         end
     end
 
+    # joint-softmax attention: flash decomposition vs circulant_similarity +
+    # joint_softmax + ⊗ (forward and gradients)
+    @testset "joint attention [$tag]" begin
+        simfun = DistanceSimilarity()
+        Wsj = (3, 5)
+        τ = sqrt(elty(d))
+        joint_ref(q, k, v) = begin
+            S1 = circulant_similarity(simfun, q ./ sqrt(τ), k ./ sqrt(τ), Wsj[1])
+            S2 = circulant_similarity(simfun, q ./ sqrt(τ), k ./ sqrt(τ), Wsj[2])
+            A1, A2 = joint_softmax(S1, S2)
+            (A1 ⊗ v, A2 ⊗ v)
+        end
+        y1_ref, y2_ref = joint_ref(q, k, v)
+        y1, y2 = circulant_flash_joint_attention(simfun, q, k, v, Wsj)
+        @test Array(y1) ≈ Array(y1_ref)  rtol=1e-4 atol=1e-6
+        @test Array(y2) ≈ Array(y2_ref)  rtol=1e-4 atol=1e-6
+
+        g_ref = Zygote.gradient((q, k, v) -> begin
+            ya, yb = joint_ref(q, k, v)
+            sum(abs2, ya) + sum(abs2, yb)
+        end, q, k, v)
+        g_fl = Zygote.gradient((q, k, v) -> begin
+            ya, yb = circulant_flash_joint_attention(simfun, q, k, v, Wsj)
+            sum(abs2, ya) + sum(abs2, yb)
+        end, q, k, v)
+        for (gr, gf) in zip(g_ref, g_fl)
+            @test Array(gf) ≈ Array(gr)  rtol=1e-3 atol=1e-5
+        end
+    end
+
+    # rrule of the (y, lse) primitive — exercises the lse cotangent path
+    @testset "rrule lse output [$tag]" begin
+        simfun = RealDotSimilarity()
+        nrows = N^nspatdims
+        test_rrule(CircAtt._circulant_flash_attention_lse, simfun,
+            q ⊢ CUDA.randn(elty, size(q)...),
+            k ⊢ CUDA.randn(elty, size(k)...),
+            v ⊢ CUDA.randn(elty, size(v)...),
+            ws;
+            output_tangent=(CUDA.randn(elty, size(v)...), CUDA.randn(real(elty), nrows, B)),
+            rtol=1e-3, atol=1e-5, check_inferred=false)
+    end
+
     # multi-head: compare against the composed path on manually split heads
     @testset "multi-head [$tag]" begin
         nheads = 2

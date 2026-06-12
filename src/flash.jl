@@ -864,14 +864,20 @@ function ∇circulant_flash_attention(
         q::AnyCuArray{Tq,N}, k::AnyCuArray{Tk,N}, v::AnyCuArray{Tv,N},
         W::Int;
         mode::Symbol=:auto,
+        Δlse=nothing,
     ) where {TΔ, Tq, Tk, Tv, N}
     Tqk = promote_type(Tq, Tk)
     dq = similar(q, Tqk)
     dk = similar(k, Tqk)
     dv = similar(v, TΔ)
 
-    # δ_r = Re⟨Δ[r,:], y[r,:]⟩ = Σ_i P[r,i] g[r,i] — the softmax-pullback shift
+    # δ_r = Re⟨Δ[r,:], y[r,:]⟩ = Σ_i P[r,i] g[r,i] — the softmax-pullback shift.
+    # A logsumexp cotangent λ enters as ds += λ_r·P[r,i] (since ∂L_r/∂s_ri =
+    # P_ri), which folds into the same formula as δ → δ - λ.
     δ = reshape(sum(real.(Δ .* conj.(y)); dims=N-1), :, size(Δ, N))
+    if Δlse !== nothing
+        δ = δ .- Δlse
+    end
 
     spatdims, CartInd, nrows, K, maxidx = _flash_launch_dims(q, W)
     C  = Int32(size(q, N-1))
@@ -952,20 +958,108 @@ function circulant_mh_flash_attention(simfun::AbstractSimilarity, q::T, k::T, v:
 end
 circulant_mh_flash_attention(q::T, k::T, v::T, W::Int, nheads::Int) where T = circulant_mh_flash_attention(DotSimilarity(), q, k, v, W, nheads)
 
+# rowwise logsumexp across the branch lse arrays; the max shift cancels
+# analytically in the gradient, so plain tracing is exact.
+function _joint_lse(lses::NTuple{M}) where M
+    Lmax = reduce((a, b) -> max.(a, b), lses)
+    s = reduce(+, map(L -> exp.(L .- Lmax), lses))
+    return log.(s) .+ Lmax
+end
+
+@doc raw"""
+    ys = circulant_flash_joint_attention(simfuns, qs, ks, vs, Ws)
+    ys = circulant_flash_joint_attention(simfun, q, k, v, Ws::NTuple{M,Int})
+
+Fused (flash) version of joint-softmax attention: each branch ``m`` computes
+circulant similarities with window ``W_m``, the softmax is normalized *jointly*
+over the union of all branches' window entries per row (as in
+[`joint_softmax`](@ref)), and branch outputs ``y_m = P_m^{joint} v_m`` are
+returned as a tuple — without materializing any attention matrix.
+
+No additional kernel is involved: the joint softmax decomposes over the
+per-branch logsumexps the fused kernels already produce,
+``y_m^{joint} = e^{L_m - L^{joint}} \odot y_m`` with
+``L^{joint} = \mathrm{logsumexp}_m(L_m)`` rowwise, so this is the per-branch
+[`circulant_flash_attention`](@ref) plus dense reweighting. Branches may have
+different windows, inputs, and similarities, but must share spatial size and
+batch. Inputs are scaled by `sqrt(sqrt(channels))` per branch as in
+[`circulant_attention`](@ref).
+
+The convenience form runs `M` branches with shared `simfun, q, k, v` and
+windows `Ws`.
+
+See also [`joint_softmax`](@ref), [`circulant_flash_attention`](@ref).
+"""
+function circulant_flash_joint_attention(
+        simfuns::NTuple{M,AbstractSimilarity},
+        qs::NTuple{M}, ks::NTuple{M}, vs::NTuple{M}, Ws::NTuple{M,Int},
+    ) where M
+    any(sf -> sf isa _UnfusableSimilarity, simfuns) && throw(ArgumentError(
+        "window-renormalizing similarities cannot be fused; use circulant_similarity + joint_softmax instead."))
+
+    outs = map(simfuns, qs, ks, vs, Ws) do simfun, q, k, v, W
+        τ = sqrt(eltype(k)(size(k, ndims(k) - 1)))
+        _circulant_flash_attention_lse(simfun, q ./ sqrt(τ), k ./ sqrt(τ), v, W)
+    end
+    ys   = map(first, outs)
+    lses = map(last, outs)
+    Lj   = _joint_lse(lses)
+
+    return map(ys, lses) do y, L
+        ω = reshape(exp.(L .- Lj), size(y)[1:ndims(y)-2]..., 1, size(y, ndims(y)))
+        ω .* y
+    end
+end
+
+function circulant_flash_joint_attention(simfun::AbstractSimilarity, q::T, k::T, v::T, Ws::NTuple{M,Int}) where {T, M}
+    circulant_flash_joint_attention(
+        ntuple(_ -> simfun, Val(M)), ntuple(_ -> q, Val(M)),
+        ntuple(_ -> k, Val(M)), ntuple(_ -> v, Val(M)), Ws)
+end
+
 # ------------------------------------------------------------------
-# rrule — fused backward
+# rrules — fused backward
 # ------------------------------------------------------------------
+
+# materialize Zero/nothing/Fill tangents into dense CuArrays shaped like ref
+# (the backward kernels and CUSPARSE cannot consume lazy tangent types)
+function _flash_materialize(Δ, ref)
+    Δ = CRC.unthunk(Δ)
+    if Δ === nothing || Δ isa CRC.AbstractZero
+        return CUDA.zeros(eltype(ref), size(ref)...)
+    elseif Δ isa Zygote.FillArrays.AbstractFill
+        return CUDA.fill(convert(eltype(ref), Zygote.FillArrays.getindex_value(Δ)), size(ref)...)
+    end
+    return Δ
+end
 
 function CRC.rrule(::typeof(_circulant_flash_attention), simfun::AbstractSimilarity, q, k, v, W::Int)
     y, lse = _circulant_flash_attention_fwd(simfun, q, k, v, W)
     project_q, project_k, project_v = CRC.ProjectTo(q), CRC.ProjectTo(k), CRC.ProjectTo(v)
     function flash_attention_pullback(Δ)
-        Δy = CRC.unthunk(Δ)
-        if Δy isa Zygote.FillArrays.AbstractFill
-            Δy = CUDA.fill(convert(eltype(y), Zygote.FillArrays.getindex_value(Δy)), size(y)...)
-        end
+        Δy = _flash_materialize(Δ, y)
         ∂q, ∂k, ∂v = ∇circulant_flash_attention(simfun, Δy, y, lse, q, k, v, W)
         return CRC.NoTangent(), CRC.NoTangent(), project_q(∂q), project_k(∂k), project_v(∂v), CRC.NoTangent()
     end
     return y, flash_attention_pullback
+end
+
+# (y, lse) variant: exposes the per-row logsumexp as a differentiable output,
+# which is what joint normalization needs.
+function _circulant_flash_attention_lse(simfun::AbstractSimilarity, q, k, v, W::Int)
+    _circulant_flash_attention_fwd(simfun, q, k, v, W)
+end
+
+function CRC.rrule(::typeof(_circulant_flash_attention_lse), simfun::AbstractSimilarity, q, k, v, W::Int)
+    y, lse = _circulant_flash_attention_fwd(simfun, q, k, v, W)
+    project_q, project_k, project_v = CRC.ProjectTo(q), CRC.ProjectTo(k), CRC.ProjectTo(v)
+    function flash_attention_lse_pullback(Δ)
+        Δ  = CRC.unthunk(Δ)
+        Δy = _flash_materialize(Δ[1], y)
+        Δλ = CRC.unthunk(Δ[2])
+        Δλ = (Δλ === nothing || Δλ isa CRC.AbstractZero) ? nothing : _flash_materialize(Δλ, lse)
+        ∂q, ∂k, ∂v = ∇circulant_flash_attention(simfun, Δy, y, lse, q, k, v, W; Δlse=Δλ)
+        return CRC.NoTangent(), CRC.NoTangent(), project_q(∂q), project_k(∂k), project_v(∂v), CRC.NoTangent()
+    end
+    return (y, lse), flash_attention_lse_pullback
 end

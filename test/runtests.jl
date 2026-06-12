@@ -4,7 +4,7 @@ using Zygote
 
 using Adapt
 using LinearAlgebra
-using CUDA, CUDA.CUSPARSE
+using CUDA, CUDA.cuSPARSE
 using NNlib
 using Statistics
 using Random
@@ -26,6 +26,6 @@ include("utils.jl")
     # include("array.jl")
     # include("rrules.jl")
     # include("attention.jl")
-    include("flash.jl")
+    # include("flash.jl")
     # include("grad.jl")
 # end

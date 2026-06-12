@@ -79,6 +79,7 @@ date = string(Dates.now())
 dev_name = CUDA.name(CUDA.device())
 
 for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsize in 5:10:45
+# for elty in (Float32,), tensorsize in ((128, 128, 64, 2),), windowsize in 5:10:25
     H, W, C, B = tensorsize
     N = H*W
 

@@ -44,6 +44,10 @@
 #     recomputed once per CH-channel chunk; one thread per row also means low
 #     occupancy for typical N·B.
 #
+# Indexing: the host reshapes all tensors to (nrows, channels, batch), so the
+# kernels index spatial positions linearly (identical addressing to the
+# CartesianIndex form, column-major).
+#
 # Index convention (matches circulant_similarity! and rrules.jl):
 # window entry κ of row r sits at nnz index n = (r-1)K + κ with column
 # i = first(cartesian_circulant(n, spatdims, W)), and S[r,i] = simval(q_r, k_i).
@@ -51,6 +55,15 @@
 # Wrapper similarities renormalize over the full window (sorting/thresholding),
 # which cannot be streamed entry-by-entry.
 const _UnfusableSimilarity = Union{TopKSimilarity, SparsemaxSimilarity, EntmaxSimilarity}
+
+# fast transcendentals for the device code: on GPU these lower to the fast
+# PTX paths (__nv_fast_expf / ex2.approx — which maps -Inf to 0, so the
+# softmax sentinels stay correct); on CPU Base.FastMath falls back to the
+# precise versions, keeping the CPU validation harness bit-identical.
+# NB: do NOT use `@cuda fastmath=true` on these kernels — GPUCompiler sets
+# ninf/nnan on every FP instruction, which makes the -Inf sentinels UB.
+@inline _fastexp(x) = @fastmath exp(x)
+@inline _fastlog(x) = @fastmath log(x)
 
 # ------------------------------------------------------------------
 # device-side chunk accumulators
@@ -60,11 +73,11 @@ const _UnfusableSimilarity = Union{TopKSimilarity, SparsemaxSimilarity, EntmaxSi
 # (acc, c0) makes Julia box it, which is uncompilable on GPU.
 # ------------------------------------------------------------------
 
-# acc[t] += w * src[Cidx, c0+t, b] for channels c0+t <= Cmax
-@inline function _chunk_muladd(acc::NTuple{CH}, w, src, Cidx, b::Int32, c0::Int32, Cmax::Int32) where CH
+# acc[t] += w * src[idx, c0+t, b] for channels c0+t <= Cmax
+@inline function _chunk_muladd(acc::NTuple{CH}, w, src, idx, b::Int32, c0::Int32, Cmax::Int32) where CH
     ntuple(Val(CH)) do t
         c = c0 + Int32(t)
-        c <= Cmax ? muladd(w, @inbounds(src[Cidx, c, b]), acc[t]) : acc[t]
+        c <= Cmax ? muladd(w, @inbounds(src[idx, c, b]), acc[t]) : acc[t]
     end
 end
 
@@ -85,11 +98,10 @@ end
         y, lse, simfun::AbstractSimilarity, q, k, v,
         r::Int32, b::Int32,
         K::Int32, C::Int32, Cv::Int32,
-        spatdims, CartInd, W::Int32, ::Val{CH},
+        spatdims, W::Int32, scale, ::Val{CH},
     ) where CH
     Ts   = simval_dtype(simfun, eltype(q), eltype(k))
     Tacc = promote_type(Ts, eltype(v))
-    Cr   = @inbounds CartInd[r]
     base = (r - 1i32) * K
 
     # pass 1: online max and normalizer
@@ -97,13 +109,13 @@ end
     l = zero(Ts)
     for κ in 1i32:K
         i, _ = cartesian_circulant(base + κ, spatdims, W)
-        s = simval(simfun, q, k, Cr, @inbounds(CartInd[i]), b, C)
+        s = scale * simval(simfun, q, k, r, i, b, C)
         mnew = max(m, s)
-        l = l * exp(m - mnew) + exp(s - mnew)
+        l = l * _fastexp(m - mnew) + _fastexp(s - mnew)
         m = mnew
     end
     linv = inv(l)
-    @inbounds lse[r, b] = m + log(l)
+    @inbounds lse[r, b] = m + _fastlog(l)
 
     # pass 2: accumulate softmax-weighted v, CH channels at a time
     zacc = zero(Tacc)
@@ -112,14 +124,13 @@ end
         acc = ntuple(_ -> zacc, Val(CH))
         for κ in 1i32:K
             i, _ = cartesian_circulant(base + κ, spatdims, W)
-            Ci = @inbounds CartInd[i]
-            p = exp(simval(simfun, q, k, Cr, Ci, b, C) - m) * linv
-            acc = _chunk_muladd(acc, p, v, Ci, b, c0, Cv)
+            p = _fastexp(scale * simval(simfun, q, k, r, i, b, C) - m) * linv
+            acc = _chunk_muladd(acc, p, v, i, b, c0, Cv)
         end
         for t in 1:CH
             c = c0 + Int32(t)
             if c <= Cv
-                @inbounds y[Cr, c, b] = acc[t]
+                @inbounds y[r, c, b] = acc[t]
             end
         end
         c0 += Int32(CH)
@@ -130,7 +141,7 @@ end
 function circulant_flash_attention_kernel!(
         y, lse, simfun::AbstractSimilarity, q, k, v,
         nrows::Int32, K::Int32, C::Int32, Cv::Int32,
-        spatdims, CartInd, W::Int32, maxidx::Int32,
+        spatdims, W::Int32, scale, maxidx::Int32,
         chunk::Val{CH},
     ) where CH
     tid    = (blockIdx().x - 1i32) * blockDim().x + threadIdx().x
@@ -139,7 +150,7 @@ function circulant_flash_attention_kernel!(
     while tid <= maxidx
         r = (tid - 1i32) % nrows + 1i32
         b = (tid - 1i32) ÷ nrows + 1i32
-        _flash_attention_row!(y, lse, simfun, q, k, v, r, b, K, C, Cv, spatdims, CartInd, W, chunk)
+        _flash_attention_row!(y, lse, simfun, q, k, v, r, b, K, C, Cv, spatdims, W, scale, chunk)
         tid += stride
     end
     return nothing
@@ -159,27 +170,27 @@ end
 @inline _simgrad_beta(::Union{DotSimilarity, RealDotSimilarity, PIDotSimilarity}, ::Type{Ts}) where Ts = zero(real(Ts))
 @inline _simgrad_beta(::Union{DistanceSimilarity, PIDistanceSimilarity}, ::Type{Ts}) where Ts = -one(real(Ts))
 
-@inline function simgrad_aux(sf::Union{DotSimilarity, RealDotSimilarity}, q, k, Cr, Ci, b, C::Int32)
-    s = simval(RealDotSimilarity(), q, k, Cr, Ci, b, C)
+@inline function simgrad_aux(sf::Union{DotSimilarity, RealDotSimilarity}, q, k, r, i, b, C::Int32)
+    s = simval(RealDotSimilarity(), q, k, r, i, b, C)
     return s, one(s), _simgrad_beta(sf, typeof(s))
 end
 
-@inline function simgrad_aux(sf::DistanceSimilarity, q, k, Cr, Ci, b, C::Int32)
-    s = simval(DistanceSimilarity(), q, k, Cr, Ci, b, C)
+@inline function simgrad_aux(sf::DistanceSimilarity, q, k, r, i, b, C::Int32)
+    s = simval(DistanceSimilarity(), q, k, r, i, b, C)
     return s, one(s), _simgrad_beta(sf, typeof(s))
 end
 
-@inline function simgrad_aux(sf::PIDotSimilarity, q, k, Cr, Ci, b, C::Int32)
-    z = simval(DotSimilarity(), q, k, Cr, Ci, b, C)
+@inline function simgrad_aux(sf::PIDotSimilarity, q, k, r, i, b, C::Int32)
+    z = simval(DotSimilarity(), q, k, r, i, b, C)
     s = abs(z)
     return s, sign(z), _simgrad_beta(sf, typeof(s))
 end
 
-@inline function simgrad_aux(sf::PIDistanceSimilarity, q, k, Cr, Ci, b, C::Int32)
+@inline function simgrad_aux(sf::PIDistanceSimilarity, q, k, r, i, b, C::Int32)
     Ts = promote_type(eltype(q), eltype(k))
     s_xx = zero(real(Ts)); s_xy = zero(Ts); s_yy = zero(real(Ts))
-    @inbounds for m in 1i32:C
-        qm = q[Cr, m, b]; km = k[Ci, m, b]
+    @fastmath @inbounds for m in 1i32:C
+        qm = q[r, m, b]; km = k[i, m, b]
         s_xx += abs2(qm)
         s_xy += qm * conj(km)
         s_yy += abs2(km)
@@ -189,10 +200,10 @@ end
 end
 
 # g[r,i] = Re⟨Δ[r,:], v[i,:]⟩ — the ∂A entry of the A ⊠ V pullback.
-@inline function _flash_gval(Δ, v, Cr, Ci, b, Cv::Int32)
+@inline function _flash_gval(Δ, v, r, i, b, Cv::Int32)
     g = zero(real(promote_type(eltype(Δ), eltype(v))))
-    @inbounds for c in 1i32:Cv
-        g += real(Δ[Cr, c, b] * conj(v[Ci, c, b]))
+    @fastmath @inbounds for c in 1i32:Cv
+        g += real(Δ[r, c, b] * conj(v[i, c, b]))
     end
     return g
 end
@@ -201,11 +212,10 @@ end
         dq, dk, dv, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
         a::Int32, b::Int32,
         K::Int32, C::Int32, Cv::Int32,
-        spatdims, CartInd, W::Int32, ::Val{CH},
+        spatdims, W::Int32, scale, ::Val{CH},
     ) where CH
     Tqk  = promote_type(eltype(q), eltype(k))
     TΔ   = eltype(Δ)
-    Ca   = @inbounds CartInd[a]
     base = (a - 1i32) * K
     lse_a = @inbounds lse[a, b]
     δ_a   = @inbounds δ[a, b]
@@ -218,15 +228,14 @@ end
         acc = ntuple(_ -> zqk, Val(CH))
         for κ in 1i32:K
             i, _ = cartesian_circulant(base + κ, spatdims, W)
-            Ci = @inbounds CartInd[i]
-            s, α, β = simgrad_aux(simfun, q, k, Ca, Ci, b, C)
-            P  = exp(s - lse_a)
-            ds = P * (_flash_gval(Δ, v, Ca, Ci, b, Cv) - δ_a)
-            acc = _chunk_simgrad(acc, ds, α, β, k, Ci, q, Ca, b, c0, C)
+            s, α, β = simgrad_aux(simfun, q, k, a, i, b, C)
+            P  = _fastexp(scale * s - lse_a)
+            ds = P * (_flash_gval(Δ, v, a, i, b, Cv) - δ_a)
+            acc = _chunk_simgrad(acc, scale * ds, α, β, k, i, q, a, b, c0, C)
         end
         for t in 1:CH
             c = c0 + Int32(t)
-            c <= C && (@inbounds dq[Ca, c, b] = acc[t])
+            c <= C && (@inbounds dq[a, c, b] = acc[t])
         end
         c0 += Int32(CH)
     end
@@ -241,17 +250,16 @@ end
         accv = ntuple(_ -> zΔ, Val(CH))
         for κ in 1i32:K
             r, _ = cartesian_circulant(base + κ, spatdims, W)
-            Cr = @inbounds CartInd[r]
-            s, α, β = simgrad_aux(simfun, q, k, Cr, Ca, b, C)
-            P  = exp(s - @inbounds(lse[r, b]))
-            ds = P * (_flash_gval(Δ, v, Cr, Ca, b, Cv) - @inbounds(δ[r, b]))
-            acck = _chunk_simgrad(acck, ds, conj(α), β, q, Cr, k, Ca, b, c0, C)
-            accv = _chunk_muladd(accv, P, Δ, Cr, b, c0, Cv)
+            s, α, β = simgrad_aux(simfun, q, k, r, a, b, C)
+            P  = _fastexp(scale * s - @inbounds(lse[r, b]))
+            ds = P * (_flash_gval(Δ, v, r, a, b, Cv) - @inbounds(δ[r, b]))
+            acck = _chunk_simgrad(acck, scale * ds, conj(α), β, q, r, k, a, b, c0, C)
+            accv = _chunk_muladd(accv, P, Δ, r, b, c0, Cv)
         end
         for t in 1:CH
             c = c0 + Int32(t)
-            c <= C  && (@inbounds dk[Ca, c, b] = acck[t])
-            c <= Cv && (@inbounds dv[Ca, c, b] = accv[t])
+            c <= C  && (@inbounds dk[a, c, b] = acck[t])
+            c <= Cv && (@inbounds dv[a, c, b] = accv[t])
         end
         c0 += Int32(CH)
     end
@@ -261,7 +269,7 @@ end
 function circulant_flash_attention_bwd_kernel!(
         dq, dk, dv, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
         nrows::Int32, K::Int32, C::Int32, Cv::Int32,
-        spatdims, CartInd, W::Int32, maxidx::Int32,
+        spatdims, W::Int32, scale, maxidx::Int32,
         chunk::Val{CH},
     ) where CH
     tid    = (blockIdx().x - 1i32) * blockDim().x + threadIdx().x
@@ -270,7 +278,7 @@ function circulant_flash_attention_bwd_kernel!(
     while tid <= maxidx
         a = (tid - 1i32) % nrows + 1i32
         b = (tid - 1i32) ÷ nrows + 1i32
-        _flash_attention_bwd_row!(dq, dk, dv, simfun, q, k, v, Δ, lse, δ, a, b, K, C, Cv, spatdims, CartInd, W, chunk)
+        _flash_attention_bwd_row!(dq, dk, dv, simfun, q, k, v, Δ, lse, δ, a, b, K, C, Cv, spatdims, W, scale, chunk)
         tid += stride
     end
     return nothing
@@ -312,25 +320,23 @@ end
         y, lse, simfun::AbstractSimilarity, q, k, v,
         r::Int32, b::Int32, lane::Int32, submask::UInt32,
         K::Int32, C::Int32, Cv::Int32,
-        spatdims, CartInd, W::Int32, ::Val{WS}, ::Val{NE},
+        spatdims, W::Int32, scale, ::Val{WS}, ::Val{NE},
     ) where {WS, NE}
     Ts   = simval_dtype(simfun, eltype(q), eltype(k))
     Tacc = promote_type(Ts, eltype(v))
-    Cr   = @inbounds CartInd[r]
     base = (r - 1i32) * K
 
     # this lane's window columns (clamped) and similarities, in registers.
     # neginf is hoisted as a value: calling typemin on a closure-captured type
     # variable widens to DataType under GPUCompiler (dynamic invocation).
     neginf = typemin(Ts)
-    Cis = ntuple(Val(NE)) do e
+    cols = ntuple(Val(NE)) do e
         κ = lane + Int32(e-1) * Int32(WS)
-        i = κ <= K ? first(cartesian_circulant(base + κ, spatdims, W)) : 1i32
-        @inbounds CartInd[i]
+        κ <= K ? first(cartesian_circulant(base + κ, spatdims, W)) : 1i32
     end
     svals = ntuple(Val(NE)) do e
         κ = lane + Int32(e-1) * Int32(WS)
-        κ <= K ? simval(simfun, q, k, Cr, Cis[e], b, C) : neginf
+        κ <= K ? scale * simval(simfun, q, k, r, cols[e], b, C) : neginf
     end
 
     # sub-warp softmax statistics
@@ -341,26 +347,26 @@ end
     m = _warp_reduce(max, m_lane, submask, Val(WS))
     l_lane = zero(Ts)
     for e in 1:NE
-        l_lane += exp(svals[e] - m)
+        l_lane += _fastexp(svals[e] - m)
     end
     l = _warp_reduce(+, l_lane, submask, Val(WS))
     linv = inv(l)
     if lane == 1i32
-        @inbounds lse[r, b] = m + log(l)
+        @inbounds lse[r, b] = m + _fastlog(l)
     end
 
-    wvals = ntuple(e -> exp(svals[e] - m) * linv, Val(NE))
+    wvals = ntuple(e -> _fastexp(svals[e] - m) * linv, Val(NE))
 
     # per channel: lane partial, butterfly reduce, lane 1 writes
     c = 1i32
     while c <= Cv
         p = zero(Tacc)
         for e in 1:NE
-            p = muladd(wvals[e], @inbounds(v[Cis[e], c, b]), p)
+            p = muladd(wvals[e], @inbounds(v[cols[e], c, b]), p)
         end
         p = _warp_reduce(+, p, submask, Val(WS))
         if lane == 1i32
-            @inbounds y[Cr, c, b] = p
+            @inbounds y[r, c, b] = p
         end
         c += 1i32
     end
@@ -370,7 +376,7 @@ end
 function circulant_flash_attention_warp_kernel!(
         y, lse, simfun::AbstractSimilarity, q, k, v,
         nrows::Int32, K::Int32, C::Int32, Cv::Int32,
-        spatdims, CartInd, W::Int32, ngroups::Int32,
+        spatdims, W::Int32, scale, ngroups::Int32,
         ws::Val{WS}, ne::Val{NE},
     ) where {WS, NE}
     tid     = (blockIdx().x - 1i32) * blockDim().x + threadIdx().x
@@ -384,7 +390,7 @@ function circulant_flash_attention_warp_kernel!(
     while g <= ngroups
         r = (g - 1i32) % nrows + 1i32
         b = (g - 1i32) ÷ nrows + 1i32
-        _flash_warp_fwd_group!(y, lse, simfun, q, k, v, r, b, lane, submask, K, C, Cv, spatdims, CartInd, W, ws, ne)
+        _flash_warp_fwd_group!(y, lse, simfun, q, k, v, r, b, lane, submask, K, C, Cv, spatdims, W, scale, ws, ne)
         g += gstride
     end
     return nothing
@@ -394,34 +400,32 @@ end
         dq, dk, dv, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
         a::Int32, b::Int32, lane::Int32, submask::UInt32,
         K::Int32, C::Int32, Cv::Int32,
-        spatdims, CartInd, W::Int32, ::Val{WS}, ::Val{NE},
+        spatdims, W::Int32, scale, ::Val{WS}, ::Val{NE},
     ) where {WS, NE}
     Ts  = simval_dtype(simfun, eltype(q), eltype(k))
     Tqk = promote_type(eltype(q), eltype(k))
     TΔ  = eltype(Δ)
     β   = _simgrad_beta(simfun, Tqk)
-    Ca   = @inbounds CartInd[a]
     base = (a - 1i32) * K
     lse_a = @inbounds lse[a, b]
     δ_a   = @inbounds δ[a, b]
 
     # window columns of row a — by pattern symmetry also the rows whose
-    # window contains column a (cols: linear, for lse/δ; Cis: cartesian)
+    # window contains column a
     cols = ntuple(Val(NE)) do e
         κ = lane + Int32(e-1) * Int32(WS)
         κ <= K ? first(cartesian_circulant(base + κ, spatdims, W)) : 1i32
     end
-    Cis = ntuple(e -> (@inbounds CartInd[cols[e]]), Val(NE))
 
     # ---- sweep 1: a as row — per-entry (ds·α, ds), then ∂q[a,:] ----------
     # ∂q[a,c] = Σ_e ds_e α_e k[i_e,c]  +  β q[a,c] Σ_e ds_e
     sw1 = ntuple(Val(NE)) do e
         κ = lane + Int32(e-1) * Int32(WS)
-        s, α, _ = simgrad_aux(simfun, q, k, Ca, Cis[e], b, C)
-        P  = exp(s - lse_a)
-        ds = P * (_flash_gval(Δ, v, Ca, Cis[e], b, Cv) - δ_a)
+        s, α, _ = simgrad_aux(simfun, q, k, a, cols[e], b, C)
+        P  = _fastexp(scale * s - lse_a)
+        sds = scale * (P * (_flash_gval(Δ, v, a, cols[e], b, Cv) - δ_a))
         valid = κ <= K
-        (valid ? ds * α : zero(ds * α), valid ? ds : zero(ds))
+        (valid ? sds * α : zero(sds * α), valid ? sds : zero(sds))
     end
     ds1_lane = zero(real(Ts))
     for e in 1:NE
@@ -433,11 +437,11 @@ end
     while c <= C
         p = zero(Tqk)
         for e in 1:NE
-            p += sw1[e][1] * @inbounds(k[Cis[e], c, b])
+            p += sw1[e][1] * @inbounds(k[cols[e], c, b])
         end
         p = _warp_reduce(+, p, submask, Val(WS))
         if lane == 1i32
-            @inbounds dq[Ca, c, b] = p + β * ds1 * @inbounds(q[Ca, c, b])
+            @inbounds dq[a, c, b] = p + β * ds1 * @inbounds(q[a, c, b])
         end
         c += 1i32
     end
@@ -447,11 +451,11 @@ end
     # ∂v[a,c] = Σ_e P_e Δ[r_e,c]
     sw2 = ntuple(Val(NE)) do e
         κ = lane + Int32(e-1) * Int32(WS)
-        s, α, _ = simgrad_aux(simfun, q, k, Cis[e], Ca, b, C)
-        P  = exp(s - @inbounds(lse[cols[e], b]))
-        ds = P * (_flash_gval(Δ, v, Cis[e], Ca, b, Cv) - @inbounds(δ[cols[e], b]))
+        s, α, _ = simgrad_aux(simfun, q, k, cols[e], a, b, C)
+        P  = _fastexp(scale * s - @inbounds(lse[cols[e], b]))
+        sds = scale * (P * (_flash_gval(Δ, v, cols[e], a, b, Cv) - @inbounds(δ[cols[e], b])))
         valid = κ <= K
-        (valid ? ds * conj(α) : zero(ds * α), valid ? P : zero(P), valid ? ds : zero(ds))
+        (valid ? sds * conj(α) : zero(sds * α), valid ? P : zero(P), valid ? sds : zero(sds))
     end
     ds2_lane = zero(real(Ts))
     for e in 1:NE
@@ -466,17 +470,17 @@ end
         pv = zero(TΔ)
         for e in 1:NE
             if c <= C
-                pk += sw2[e][1] * @inbounds(q[Cis[e], c, b])
+                pk += sw2[e][1] * @inbounds(q[cols[e], c, b])
             end
             if c <= Cv
-                pv = muladd(sw2[e][2], @inbounds(Δ[Cis[e], c, b]), pv)
+                pv = muladd(sw2[e][2], @inbounds(Δ[cols[e], c, b]), pv)
             end
         end
         pk = _warp_reduce(+, pk, submask, Val(WS))
         pv = _warp_reduce(+, pv, submask, Val(WS))
         if lane == 1i32
-            c <= C  && (@inbounds dk[Ca, c, b] = pk + β * ds2 * @inbounds(k[Ca, c, b]))
-            c <= Cv && (@inbounds dv[Ca, c, b] = pv)
+            c <= C  && (@inbounds dk[a, c, b] = pk + β * ds2 * @inbounds(k[a, c, b]))
+            c <= Cv && (@inbounds dv[a, c, b] = pv)
         end
         c += 1i32
     end
@@ -486,7 +490,7 @@ end
 function circulant_flash_attention_bwd_warp_kernel!(
         dq, dk, dv, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
         nrows::Int32, K::Int32, C::Int32, Cv::Int32,
-        spatdims, CartInd, W::Int32, ngroups::Int32,
+        spatdims, W::Int32, scale, ngroups::Int32,
         ws::Val{WS}, ne::Val{NE},
     ) where {WS, NE}
     tid     = (blockIdx().x - 1i32) * blockDim().x + threadIdx().x
@@ -499,7 +503,7 @@ function circulant_flash_attention_bwd_warp_kernel!(
     while g <= ngroups
         a = (g - 1i32) % nrows + 1i32
         b = (g - 1i32) ÷ nrows + 1i32
-        _flash_warp_bwd_group!(dq, dk, dv, simfun, q, k, v, Δ, lse, δ, a, b, lane, submask, K, C, Cv, spatdims, CartInd, W, ws, ne)
+        _flash_warp_bwd_group!(dq, dk, dv, simfun, q, k, v, Δ, lse, δ, a, b, lane, submask, K, C, Cv, spatdims, W, scale, ws, ne)
         g += gstride
     end
     return nothing
@@ -564,7 +568,7 @@ end
 function circulant_flash_attention_block_kernel!(
         y, lse, simfun::AbstractSimilarity, q, k, v,
         nrows::Int32, K::Int32, C::Int32, Cv::Int32,
-        spatdims, CartInd, W::Int32, ngroups::Int32,
+        spatdims, W::Int32, scale, ngroups::Int32,
     )
     Ts   = simval_dtype(simfun, eltype(q), eltype(k))
     Tacc = promote_type(Ts, eltype(v))
@@ -583,7 +587,6 @@ function circulant_flash_attention_block_kernel!(
     while g <= ngroups
         r = (g - 1i32) % nrows + 1i32
         b = (g - 1i32) ÷ nrows + 1i32
-        Cr   = @inbounds CartInd[r]
         base = (r - 1i32) * K
 
         # phase 1: similarities into shared, block softmax statistics
@@ -591,7 +594,7 @@ function circulant_flash_attention_block_kernel!(
         κ = tid
         while κ <= K
             i, _ = cartesian_circulant(base + κ, spatdims, W)
-            s = simval(simfun, q, k, Cr, @inbounds(CartInd[i]), b, C)
+            s = scale * simval(simfun, q, k, r, i, b, C)
             @inbounds w_sh[κ]   = s
             @inbounds col_sh[κ] = i
             mloc = max(mloc, s)
@@ -602,7 +605,7 @@ function circulant_flash_attention_block_kernel!(
         lloc = zero(Ts)
         κ = tid
         while κ <= K
-            e = exp(@inbounds(w_sh[κ]) - m)
+            e = _fastexp(@inbounds(w_sh[κ]) - m)
             @inbounds w_sh[κ] = e
             lloc += e
             κ += TB
@@ -615,7 +618,7 @@ function circulant_flash_attention_block_kernel!(
             κ += TB
         end
         if tid == 1i32
-            @inbounds lse[r, b] = m + log(l)
+            @inbounds lse[r, b] = m + _fastlog(l)
         end
         sync_threads()
 
@@ -625,12 +628,12 @@ function circulant_flash_attention_block_kernel!(
             p = zero(Tacc)
             κ = lane
             while κ <= K
-                p = muladd(@inbounds(w_sh[κ]), @inbounds(v[CartInd[col_sh[κ]], c, b]), p)
+                p = muladd(@inbounds(w_sh[κ]), @inbounds(v[col_sh[κ], c, b]), p)
                 κ += 32i32
             end
             p = _warp_reduce(+, p, 0xffffffff, Val(32))
             if lane == 1i32
-                @inbounds y[Cr, c, b] = p
+                @inbounds y[r, c, b] = p
             end
             c += nwarps
         end
@@ -643,7 +646,7 @@ end
 function circulant_flash_attention_bwd_block_kernel!(
         dq, dk, dv, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
         nrows::Int32, K::Int32, C::Int32, Cv::Int32,
-        spatdims, CartInd, W::Int32, ngroups::Int32,
+        spatdims, W::Int32, scale, ngroups::Int32,
     )
     Tq = eltype(q); Tk = eltype(k); TΔ = eltype(Δ)
     Ts, Tds, Tw = _flash_bwd_wtypes(simfun, Tq, Tk, TΔ, eltype(v))
@@ -665,7 +668,6 @@ function circulant_flash_attention_bwd_block_kernel!(
     while g <= ngroups
         a = (g - 1i32) % nrows + 1i32
         b = (g - 1i32) ÷ nrows + 1i32
-        Ca   = @inbounds CartInd[a]
         base = (a - 1i32) * K
         lse_a = @inbounds lse[a, b]
         δ_a   = @inbounds δ[a, b]
@@ -682,12 +684,12 @@ function circulant_flash_attention_bwd_block_kernel!(
         dsloc = zero(Tds)
         κ = tid
         while κ <= K
-            Ci = @inbounds CartInd[col_sh[κ]]
-            s, α, _ = simgrad_aux(simfun, q, k, Ca, Ci, b, C)
-            P  = exp(s - lse_a)
-            ds = P * (_flash_gval(Δ, v, Ca, Ci, b, Cv) - δ_a)
-            @inbounds u_sh[κ] = ds * α
-            dsloc += ds
+            @inbounds i = col_sh[κ]
+            s, α, _ = simgrad_aux(simfun, q, k, a, i, b, C)
+            P  = _fastexp(scale * s - lse_a)
+            sds = scale * (P * (_flash_gval(Δ, v, a, i, b, Cv) - δ_a))
+            @inbounds u_sh[κ] = sds * α
+            dsloc += sds
             κ += TB
         end
         ds1 = _block_reduce(+, dsloc, zero(Tds), scratch)
@@ -697,12 +699,12 @@ function circulant_flash_attention_bwd_block_kernel!(
             p = zero(Tqk)
             κ = lane
             while κ <= K
-                p += @inbounds(u_sh[κ]) * @inbounds(k[CartInd[col_sh[κ]], c, b])
+                p += @inbounds(u_sh[κ]) * @inbounds(k[col_sh[κ], c, b])
                 κ += 32i32
             end
             p = _warp_reduce(+, p, 0xffffffff, Val(32))
             if lane == 1i32
-                @inbounds dq[Ca, c, b] = p + β * ds1 * @inbounds(q[Ca, c, b])
+                @inbounds dq[a, c, b] = p + β * ds1 * @inbounds(q[a, c, b])
             end
             c += nwarps
         end
@@ -712,13 +714,13 @@ function circulant_flash_attention_bwd_block_kernel!(
         dsloc = zero(Tds)
         κ = tid
         while κ <= K
-            Cr = @inbounds CartInd[col_sh[κ]]
-            s, α, _ = simgrad_aux(simfun, q, k, Cr, Ca, b, C)
-            P  = exp(s - @inbounds(lse[col_sh[κ], b]))
-            ds = P * (_flash_gval(Δ, v, Cr, Ca, b, Cv) - @inbounds(δ[col_sh[κ], b]))
-            @inbounds u_sh[κ] = ds * conj(α)
+            r = @inbounds col_sh[κ]
+            s, α, _ = simgrad_aux(simfun, q, k, r, a, b, C)
+            P  = _fastexp(scale * s - @inbounds(lse[col_sh[κ], b]))
+            sds = scale * (P * (_flash_gval(Δ, v, r, a, b, Cv) - @inbounds(δ[col_sh[κ], b])))
+            @inbounds u_sh[κ] = sds * conj(α)
             @inbounds P_sh[κ] = P
-            dsloc += ds
+            dsloc += sds
             κ += TB
         end
         ds2 = _block_reduce(+, dsloc, zero(Tds), scratch)
@@ -730,7 +732,7 @@ function circulant_flash_attention_bwd_block_kernel!(
             pv = zero(TΔ)
             κ = lane
             while κ <= K
-                Cc = @inbounds CartInd[col_sh[κ]]
+                Cc = @inbounds col_sh[κ]
                 if c <= C
                     pk += @inbounds(u_sh[κ]) * @inbounds(q[Cc, c, b])
                 end
@@ -742,8 +744,8 @@ function circulant_flash_attention_bwd_block_kernel!(
             pk = _warp_reduce(+, pk, 0xffffffff, Val(32))
             pv = _warp_reduce(+, pv, 0xffffffff, Val(32))
             if lane == 1i32
-                c <= C  && (@inbounds dk[Ca, c, b] = pk + β * ds2 * @inbounds(k[Ca, c, b]))
-                c <= Cv && (@inbounds dv[Ca, c, b] = pv)
+                c <= C  && (@inbounds dk[a, c, b] = pk + β * ds2 * @inbounds(k[a, c, b]))
+                c <= Cv && (@inbounds dv[a, c, b] = pv)
             end
             c += nwarps
         end
@@ -762,16 +764,18 @@ _flash_chunk(::Type{T}) where T = T <: Complex ? Val(16) : Val(32)
 
 function _flash_launch_dims(q::AbstractArray{Tq,N}, W::Int) where {Tq,N}
     spatdims = ntuple(i -> Int32(size(q, i)), N-2)
-    CartInd  = CartesianIndices(spatdims)
     nrows    = Int32(prod(spatdims))
     K        = Int32(W)^Int32(N-2)
     maxidx   = nrows * Int32(size(q, N))
-    return spatdims, CartInd, nrows, K, maxidx
+    return spatdims, nrows, K, maxidx
 end
 
 # Sub-warp width and entries-per-lane. Beyond _FLASH_WARP_MAX_NE registers of
-# window state per lane (K > 1024) the block-per-row kernels take over.
-const _FLASH_WARP_MAX_NE = 32
+# window state per lane the block-per-row kernels take over. A100 measurements
+# (128×128×64×2, DistanceSimilarity): NE=8 (K=225) warp 2.0ms vs block 6.2ms,
+# NE=20 (K=625) warp 9.6ms vs block 7.7ms — the crossover is register
+# pressure, between NE=8 and NE=20.
+const _FLASH_WARP_MAX_NE = 8
 
 # dynamic shared memory budget for the block kernels (default 48KB per block,
 # minus headroom for the 32-slot static reduction scratch)
@@ -779,7 +783,11 @@ const _FLASH_BLOCK_MAX_SHMEM = 47 * 1024
 const _FLASH_BLOCK_THREADS = 256
 
 function _flash_warp_dims(K::Int32)
-    WS = min(32, nextpow(2, Int(K)))
+    # Smallest sub-warp width that keeps NE ≤ _FLASH_WARP_MAX_NE: the output
+    # stage costs ~K + WS·log2(WS) lane-ops per channel, so narrow sub-warps
+    # win for small windows (K=25: WS=8 does 49 lane-ops vs 185 at WS=32).
+    # 8 lanes minimum keeps ≥ 8·nrows·B threads of parallelism.
+    WS = clamp(nextpow(2, cld(Int(K), _FLASH_WARP_MAX_NE)), 8, 32)
     NE = cld(Int(K), WS)
     return WS, NE
 end
@@ -813,7 +821,7 @@ end
 function _circulant_flash_attention_fwd(
         simfun::AbstractSimilarity,
         q::AnyCuArray{Tq,N}, k::AnyCuArray{Tk,N}, v::AnyCuArray{Tv,N},
-        W::Int;
+        W::Int, scale::Real=true;
         mode::Symbol=:auto,
     ) where {Tq, Tk, Tv, N}
     Ts = simval_dtype(simfun, Tq, Tk)
@@ -828,7 +836,7 @@ function _circulant_flash_attention_fwd(
     Tacc = promote_type(Ts, Tv)
     y = similar(v, Tacc)
 
-    spatdims, CartInd, nrows, K, maxidx = _flash_launch_dims(q, W)
+    spatdims, nrows, K, maxidx = _flash_launch_dims(q, W)
     C   = Int32(size(q, N-1))
     Cv  = Int32(size(v, N-1))
     lse = similar(q, Ts, (Int(nrows), size(q, N)))
@@ -836,15 +844,22 @@ function _circulant_flash_attention_fwd(
     shmem  = Int(K) * (sizeof(Ts) + sizeof(Int32))
     usemode = _flash_mode(mode, NE, shmem)
 
+    # kernels index spatial positions linearly: (nrows, channels, batch) views
+    yr = reshape(y, :, size(y, N-1), size(y, N))
+    qr = reshape(q, :, size(q, N-1), size(q, N))
+    kr = reshape(k, :, size(k, N-1), size(k, N))
+    vr = reshape(v, :, size(v, N-1), size(v, N))
+
+    sc = Ts(scale)
     if usemode === :warp
-        args = (y, lse, simfun, q, k, v, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx, Val(WS), Val(NE))
+        args = (yr, lse, simfun, qr, kr, vr, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx, Val(WS), Val(NE))
         _flash_warp_launch(circulant_flash_attention_warp_kernel!, args, maxidx, WS)
     elseif usemode === :block
-        args = (y, lse, simfun, q, k, v, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx)
+        args = (yr, lse, simfun, qr, kr, vr, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx)
         _flash_block_launch(circulant_flash_attention_block_kernel!, args, maxidx, shmem)
     else
         chunk = _flash_chunk(Tacc)
-        args = (y, lse, simfun, q, k, v, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx, chunk)
+        args = (yr, lse, simfun, qr, kr, vr, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx, chunk)
         kernel = @cuda launch=false circulant_flash_attention_kernel!(args...)
         config = launch_configuration(kernel.fun)
         threads = min(maxidx, config.threads)
@@ -854,15 +869,15 @@ function _circulant_flash_attention_fwd(
     return y, lse
 end
 
-function _circulant_flash_attention(simfun::AbstractSimilarity, q, k, v, W::Int)
-    first(_circulant_flash_attention_fwd(simfun, q, k, v, W))
+function _circulant_flash_attention(simfun::AbstractSimilarity, q, k, v, W::Int, scale::Real=true)
+    first(_circulant_flash_attention_fwd(simfun, q, k, v, W, scale))
 end
 
 function ∇circulant_flash_attention(
         simfun::AbstractSimilarity,
         Δ::AnyCuArray{TΔ,N}, y, lse,
         q::AnyCuArray{Tq,N}, k::AnyCuArray{Tk,N}, v::AnyCuArray{Tv,N},
-        W::Int;
+        W::Int, scale::Real=true;
         mode::Symbol=:auto,
         Δlse=nothing,
     ) where {TΔ, Tq, Tk, Tv, N}
@@ -879,7 +894,7 @@ function ∇circulant_flash_attention(
         δ = δ .- Δlse
     end
 
-    spatdims, CartInd, nrows, K, maxidx = _flash_launch_dims(q, W)
+    spatdims, nrows, K, maxidx = _flash_launch_dims(q, W)
     C  = Int32(size(q, N-1))
     Cv = Int32(size(v, N-1))
     WS, NE = _flash_warp_dims(K)
@@ -887,15 +902,24 @@ function ∇circulant_flash_attention(
     shmem = Int(K) * (sizeof(Tw) + sizeof(Ts) + sizeof(Int32))
     usemode = _flash_mode(mode, NE, shmem)
 
+    Δr = reshape(Δ, :, size(Δ, N-1), size(Δ, N))
+    qr = reshape(q, :, size(q, N-1), size(q, N))
+    kr = reshape(k, :, size(k, N-1), size(k, N))
+    vr = reshape(v, :, size(v, N-1), size(v, N))
+    dqr = reshape(dq, :, size(dq, N-1), size(dq, N))
+    dkr = reshape(dk, :, size(dk, N-1), size(dk, N))
+    dvr = reshape(dv, :, size(dv, N-1), size(dv, N))
+
+    sc = Ts(scale)
     if usemode === :warp
-        args = (dq, dk, dv, simfun, q, k, v, Δ, lse, δ, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx, Val(WS), Val(NE))
+        args = (dqr, dkr, dvr, simfun, qr, kr, vr, Δr, lse, δ, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx, Val(WS), Val(NE))
         _flash_warp_launch(circulant_flash_attention_bwd_warp_kernel!, args, maxidx, WS)
     elseif usemode === :block
-        args = (dq, dk, dv, simfun, q, k, v, Δ, lse, δ, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx)
+        args = (dqr, dkr, dvr, simfun, qr, kr, vr, Δr, lse, δ, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx)
         _flash_block_launch(circulant_flash_attention_bwd_block_kernel!, args, maxidx, shmem)
     else
         chunk = _flash_chunk(promote_type(Tqk, TΔ))
-        args = (dq, dk, dv, simfun, q, k, v, Δ, lse, δ, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx, chunk)
+        args = (dqr, dkr, dvr, simfun, qr, kr, vr, Δr, lse, δ, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx, chunk)
         kernel = @cuda launch=false circulant_flash_attention_bwd_kernel!(args...)
         config = launch_configuration(kernel.fun)
         threads = min(maxidx, config.threads)
@@ -931,8 +955,11 @@ Window-renormalizing similarities (`TopKSimilarity`, `SparsemaxSimilarity`,
 See also [`circulant_attention`](@ref), [`circulant_mh_flash_attention`](@ref).
 """
 function circulant_flash_attention(simfun::AbstractSimilarity, q::T, k::T, v::T, W::Int) where {Tv, N, T<:AbstractArray{Tv,N}}
-    τ = sqrt(Tv(size(k, N-1)))
-    _circulant_flash_attention(simfun, q ./ sqrt(τ), k ./ sqrt(τ), v, W)
+    # scaling q,k by τ^(-1/2) ≡ scaling the similarity by 1/τ for every
+    # supported simfun (dot- and distance-types are 2-homogeneous), so the
+    # scale is folded into the kernels instead of allocating scaled copies
+    scale = inv(sqrt(real(Tv)(size(k, N-1))))
+    _circulant_flash_attention(simfun, q, k, v, W, scale)
 end
 circulant_flash_attention(q::T, k::T, v::T, W::Int) where T = circulant_flash_attention(DotSimilarity(), q, k, v, W)
 
@@ -998,8 +1025,8 @@ function circulant_flash_joint_attention(
         "window-renormalizing similarities cannot be fused; use circulant_similarity + joint_softmax instead."))
 
     outs = map(simfuns, qs, ks, vs, Ws) do simfun, q, k, v, W
-        τ = sqrt(eltype(k)(size(k, ndims(k) - 1)))
-        _circulant_flash_attention_lse(simfun, q ./ sqrt(τ), k ./ sqrt(τ), v, W)
+        scale = inv(sqrt(real(eltype(k))(size(k, ndims(k) - 1))))
+        _circulant_flash_attention_lse(simfun, q, k, v, W, scale)
     end
     ys   = map(first, outs)
     lses = map(last, outs)
@@ -1033,33 +1060,45 @@ function _flash_materialize(Δ, ref)
     return Δ
 end
 
-function CRC.rrule(::typeof(_circulant_flash_attention), simfun::AbstractSimilarity, q, k, v, W::Int)
-    y, lse = _circulant_flash_attention_fwd(simfun, q, k, v, W)
+function CRC.rrule(::typeof(_circulant_flash_attention), simfun::AbstractSimilarity, q, k, v, W::Int, scale::Real)
+    y, lse = _circulant_flash_attention_fwd(simfun, q, k, v, W, scale)
     project_q, project_k, project_v = CRC.ProjectTo(q), CRC.ProjectTo(k), CRC.ProjectTo(v)
     function flash_attention_pullback(Δ)
         Δy = _flash_materialize(Δ, y)
-        ∂q, ∂k, ∂v = ∇circulant_flash_attention(simfun, Δy, y, lse, q, k, v, W)
-        return CRC.NoTangent(), CRC.NoTangent(), project_q(∂q), project_k(∂k), project_v(∂v), CRC.NoTangent()
+        ∂q, ∂k, ∂v = ∇circulant_flash_attention(simfun, Δy, y, lse, q, k, v, W, scale)
+        return CRC.NoTangent(), CRC.NoTangent(), project_q(∂q), project_k(∂k), project_v(∂v), CRC.NoTangent(), CRC.NoTangent()
     end
     return y, flash_attention_pullback
 end
 
-# (y, lse) variant: exposes the per-row logsumexp as a differentiable output,
-# which is what joint normalization needs.
-function _circulant_flash_attention_lse(simfun::AbstractSimilarity, q, k, v, W::Int)
-    _circulant_flash_attention_fwd(simfun, q, k, v, W)
+function CRC.rrule(::typeof(_circulant_flash_attention), simfun::AbstractSimilarity, q, k, v, W::Int)
+    y, pb7 = CRC.rrule(_circulant_flash_attention, simfun, q, k, v, W, true)
+    flash_attention_pullback6(Δ) = pb7(Δ)[1:6]
+    return y, flash_attention_pullback6
 end
 
-function CRC.rrule(::typeof(_circulant_flash_attention_lse), simfun::AbstractSimilarity, q, k, v, W::Int)
-    y, lse = _circulant_flash_attention_fwd(simfun, q, k, v, W)
+# (y, lse) variant: exposes the per-row logsumexp as a differentiable output,
+# which is what joint normalization needs.
+function _circulant_flash_attention_lse(simfun::AbstractSimilarity, q, k, v, W::Int, scale::Real=true)
+    _circulant_flash_attention_fwd(simfun, q, k, v, W, scale)
+end
+
+function CRC.rrule(::typeof(_circulant_flash_attention_lse), simfun::AbstractSimilarity, q, k, v, W::Int, scale::Real)
+    y, lse = _circulant_flash_attention_fwd(simfun, q, k, v, W, scale)
     project_q, project_k, project_v = CRC.ProjectTo(q), CRC.ProjectTo(k), CRC.ProjectTo(v)
     function flash_attention_lse_pullback(Δ)
         Δ  = CRC.unthunk(Δ)
         Δy = _flash_materialize(Δ[1], y)
         Δλ = CRC.unthunk(Δ[2])
         Δλ = (Δλ === nothing || Δλ isa CRC.AbstractZero) ? nothing : _flash_materialize(Δλ, lse)
-        ∂q, ∂k, ∂v = ∇circulant_flash_attention(simfun, Δy, y, lse, q, k, v, W; Δlse=Δλ)
-        return CRC.NoTangent(), CRC.NoTangent(), project_q(∂q), project_k(∂k), project_v(∂v), CRC.NoTangent()
+        ∂q, ∂k, ∂v = ∇circulant_flash_attention(simfun, Δy, y, lse, q, k, v, W, scale; Δlse=Δλ)
+        return CRC.NoTangent(), CRC.NoTangent(), project_q(∂q), project_k(∂k), project_v(∂v), CRC.NoTangent(), CRC.NoTangent()
     end
     return (y, lse), flash_attention_lse_pullback
+end
+
+function CRC.rrule(::typeof(_circulant_flash_attention_lse), simfun::AbstractSimilarity, q, k, v, W::Int)
+    out, pb7 = CRC.rrule(_circulant_flash_attention_lse, simfun, q, k, v, W, true)
+    flash_attention_lse_pullback6(Δ) = pb7(Δ)[1:6]
+    return out, flash_attention_lse_pullback6
 end

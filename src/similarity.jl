@@ -21,7 +21,7 @@ end
 @inline function simval(::RealDotSimilarity, x::AbstractArray{Tx}, y::AbstractArray{Ty}, Ci, Cj, b, M::Int32) where {Tx, Ty}
     Ts = real(promote_type(Tx, Ty))
     s = zero(Ts)
-    @inbounds for m=1i32:M
+    @fastmath @inbounds for m=1i32:M
         s += real(x[Ci, m, b] * conj(y[Cj, m, b]))
     end
     return s
@@ -40,7 +40,7 @@ end
 @inline function simval(::DistanceSimilarity, x::AbstractArray{Tx}, y::AbstractArray{Ty}, Ci, Cj, b, M::Int32) where {Tx, Ty}
     Ts = real(promote_type(Tx, Ty))
     s = zero(Ts)
-    @inbounds for m=1i32:M
+    @fastmath @inbounds for m=1i32:M
         s -= abs2(x[Ci, m, b] - y[Cj, m, b])
     end
     return Ts(0.5) * s
@@ -56,7 +56,7 @@ struct PIDotSimilarity <: AbstractSimilarity end
 @inline function simval(::PIDotSimilarity, x::AbstractArray{Tx}, y::AbstractArray{Ty}, Ci, Cj, b, M::Int32) where {Tx, Ty}
     Ts = promote_type(Tx, Ty)
     s = zero(Ts)
-    @inbounds for m=1i32:M
+    @fastmath @inbounds for m=1i32:M
         s += x[Ci, m, b]*conj(y[Cj, m, b])
     end
     return abs(s)
@@ -73,7 +73,7 @@ struct PIDistanceSimilarity <: AbstractSimilarity end
 @inline function simval(::PIDistanceSimilarity, x::AbstractArray{Tx}, y::AbstractArray{Ty}, Ci, Cj, b, M::Int32) where {Tx, Ty}
     Ts = promote_type(Tx, Ty)
     s_xx = zero(real(Ts)); s_xy = zero(Ts); s_yy = zero(real(Ts))
-    @inbounds for m=1i32:M
+    @fastmath @inbounds for m=1i32:M
         xm = x[Ci, m, b]; ym = y[Cj, m, b]
         s_xx += abs2(xm)
         s_xy += xm * conj(ym)
@@ -95,7 +95,7 @@ end
 @inline function simval(sf::DotSimilarity, x::AbstractArray{Tx}, y::AbstractArray{Ty}, Ci, Cj, b, M::Int32) where {Tx, Ty}
     Ts = promote_type(Tx, Ty)
     s = zero(Ts)
-    @inbounds for m=1i32:M
+    @fastmath @inbounds for m=1i32:M
         s += x[Ci, m, b]*conj(y[Cj, m, b])
     end
     return s
@@ -136,7 +136,9 @@ function circulant_similarity!(
     Wi32 = Int32(W)
 
     args = (A, simfun, x, y, nnzb, M, spatdims, CartInd, Wi32, maxidx)
-    kernel = @cuda launch=false circulant_similarity_kernel!(args...)
+    # all-finite kernel (no sentinels, no exp): the fastmath compile flag is
+    # safe here and re-enables accumulation-loop reassociation/contraction
+    kernel = @cuda launch=false fastmath=true circulant_similarity_kernel!(args...)
     config = launch_configuration(kernel.fun)
     threads = min(maxidx, config.threads)
     blocks  = cld(maxidx, threads)

@@ -22,6 +22,10 @@ function git_commit()
 end
 
 function bench_gpu(f; samples=50)
+    for _ in 1:3 # warmup
+        f()
+    end
+
     CUDA.synchronize()
 
     trial = @benchmark begin
@@ -31,7 +35,7 @@ function bench_gpu(f; samples=50)
     CUDA.synchronize()
 
     time_ms = median(trial).time / 1e6
-    return time_ms 
+    return time_ms
 end
 
 # --------------------------
@@ -69,11 +73,6 @@ for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsiz
     H, W, C, B = tensorsize
     N = H*W
 
-    for _ in 1:3 # warmup
-        global x, y, A
-        x, y, A = make_data(elty, tensorsize, windowsize)
-    end
-
     # similarity
     t = bench_gpu(() -> circulant_similarity(DistanceSimilarity(), x, y, windowsize))
     flops = B * N * (2*C - 1) * (windowsize^2)
@@ -96,6 +95,11 @@ for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsiz
     gf = flops / (t / 1e3) / 1e9
     push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_flash_attention", t, gf))
 
+    # thread-per-row flash kernel (reference path), for kernel-mode comparison
+    t = bench_gpu(() -> CircAtt._circulant_flash_attention_fwd(DistanceSimilarity(), x, y, x, windowsize; mode=:thread))
+    gf = flops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_flash_attention_thread", t, gf))
+
     # forward + backward: composed vs fused gradients (nominal flops ≈ 3x forward)
     gradflops = 3 * flops
     t = bench_gpu(() -> Zygote.gradient((q, k, v) -> sum(abs2, first(circulant_attention(DistanceSimilarity(), q, k, v, windowsize))), x, y, x))
@@ -105,6 +109,26 @@ for elty in (Float32, ComplexF32), tensorsize in ((128, 128, 64, 2),), windowsiz
     t = bench_gpu(() -> Zygote.gradient((q, k, v) -> sum(abs2, circulant_flash_attention(DistanceSimilarity(), q, k, v, windowsize)), x, y, x))
     gf = gradflops / (t / 1e3) / 1e9
     push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_flash_attention_gradient", t, gf))
+
+    # multi-head (nheads=4 → 16 channels per head): the per-head channel count
+    # drops, so the adjacency-matrix traffic the flash kernels avoid is a much
+    # larger fraction of the runtime than in the single-head benchmark
+    nheads = 4
+    t = bench_gpu(() -> circulant_mh_attention(DistanceSimilarity(), x, y, x, windowsize, nheads))
+    gf = flops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_mh_attention_pipeline", t, gf))
+
+    t = bench_gpu(() -> circulant_mh_flash_attention(DistanceSimilarity(), x, y, x, windowsize, nheads))
+    gf = flops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_mh_flash_attention", t, gf))
+
+    t = bench_gpu(() -> Zygote.gradient((q, k, v) -> sum(abs2, first(circulant_mh_attention(DistanceSimilarity(), q, k, v, windowsize, nheads))), x, y, x))
+    gf = gradflops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_mh_attention_gradient", t, gf))
+
+    t = bench_gpu(() -> Zygote.gradient((q, k, v) -> sum(abs2, circulant_mh_flash_attention(DistanceSimilarity(), q, k, v, windowsize, nheads)), x, y, x))
+    gf = gradflops / (t / 1e3) / 1e9
+    push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, "circulant_mh_flash_attention_gradient", t, gf))
 
     # softmax
     t = bench_gpu(() -> NNlib.softmax(A))

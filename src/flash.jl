@@ -31,7 +31,18 @@
 # position a, so no atomics are needed and every output is written once.
 #
 # Memory traffic is O(N·C) + O(N) for the logsumexp, instead of O(N·W^d).
-# The price is recomputing the similarity sweep once per CH-channel chunk.
+#
+# Three kernel families implement this scheme (selected by _flash_mode):
+#   - warp-cooperative (K ≤ 32·_FLASH_WARP_MAX_NE): a sub-warp owns each row,
+#     window entries are lane-split with similarities held in registers, and
+#     lanes combine via shfl_xor_sync butterflies — one similarity sweep.
+#   - block-per-row (larger K, while the window fits in shared memory): the
+#     per-entry state is staged in dynamic shared memory by a whole block —
+#     one similarity sweep and full occupancy at any window size.
+#   - thread-per-row (last resort, and the CPU-testable reference): softmax
+#     weights don't fit in one thread's registers, so the similarity sweep is
+#     recomputed once per CH-channel chunk; one thread per row also means low
+#     occupancy for typical N·B.
 #
 # Index convention (matches circulant_similarity! and rrules.jl):
 # window entry κ of row r sits at nnz index n = (r-1)K + κ with column
@@ -40,6 +51,30 @@
 # Wrapper similarities renormalize over the full window (sorting/thresholding),
 # which cannot be streamed entry-by-entry.
 const _UnfusableSimilarity = Union{TopKSimilarity, SparsemaxSimilarity, EntmaxSimilarity}
+
+# ------------------------------------------------------------------
+# device-side chunk accumulators
+#
+# The ntuple closures must live in their own functions with everything passed
+# as arguments: capturing a variable that is reassigned in the enclosing loop
+# (acc, c0) makes Julia box it, which is uncompilable on GPU.
+# ------------------------------------------------------------------
+
+# acc[t] += w * src[Cidx, c0+t, b] for channels c0+t <= Cmax
+@inline function _chunk_muladd(acc::NTuple{CH}, w, src, Cidx, b::Int32, c0::Int32, Cmax::Int32) where CH
+    ntuple(Val(CH)) do t
+        c = c0 + Int32(t)
+        c <= Cmax ? muladd(w, @inbounds(src[Cidx, c, b]), acc[t]) : acc[t]
+    end
+end
+
+# acc[t] += ds * (α*x[Cx, c0+t, b] + β*y[Cy, c0+t, b]) for channels c0+t <= Cmax
+@inline function _chunk_simgrad(acc::NTuple{CH}, ds, α, β, x, Cx, y, Cy, b::Int32, c0::Int32, Cmax::Int32) where CH
+    ntuple(Val(CH)) do t
+        c = c0 + Int32(t)
+        c <= Cmax ? acc[t] + ds * (α * @inbounds(x[Cx, c, b]) + β * @inbounds(y[Cy, c, b])) : acc[t]
+    end
+end
 
 # ------------------------------------------------------------------
 # forward device code
@@ -71,17 +106,15 @@ const _UnfusableSimilarity = Union{TopKSimilarity, SparsemaxSimilarity, EntmaxSi
     @inbounds lse[r, b] = m + log(l)
 
     # pass 2: accumulate softmax-weighted v, CH channels at a time
+    zacc = zero(Tacc)
     c0 = 0i32
     while c0 < Cv
-        acc = ntuple(_ -> zero(Tacc), Val(CH))
+        acc = ntuple(_ -> zacc, Val(CH))
         for κ in 1i32:K
             i, _ = cartesian_circulant(base + κ, spatdims, W)
             Ci = @inbounds CartInd[i]
             p = exp(simval(simfun, q, k, Cr, Ci, b, C) - m) * linv
-            acc = ntuple(Val(CH)) do t
-                c = c0 + Int32(t)
-                c <= Cv ? muladd(p, @inbounds(v[Ci, c, b]), acc[t]) : acc[t]
-            end
+            acc = _chunk_muladd(acc, p, v, Ci, b, c0, Cv)
         end
         for t in 1:CH
             c = c0 + Int32(t)
@@ -121,23 +154,28 @@ end
 #   ∂k[i,c] += ds·(conj(α)·q[r,c] + β·k[i,c])
 # These match the circulant_similarity rrules in rrules.jl entrywise.
 # ------------------------------------------------------------------
-@inline function simgrad_aux(::Union{DotSimilarity, RealDotSimilarity}, q, k, Cr, Ci, b, C::Int32)
+# β is constant per similarity: 0 for dot-types, -1 for distance-types
+# (the -q/-k identity term of the squared-distance gradient).
+@inline _simgrad_beta(::Union{DotSimilarity, RealDotSimilarity, PIDotSimilarity}, ::Type{Ts}) where Ts = zero(real(Ts))
+@inline _simgrad_beta(::Union{DistanceSimilarity, PIDistanceSimilarity}, ::Type{Ts}) where Ts = -one(real(Ts))
+
+@inline function simgrad_aux(sf::Union{DotSimilarity, RealDotSimilarity}, q, k, Cr, Ci, b, C::Int32)
     s = simval(RealDotSimilarity(), q, k, Cr, Ci, b, C)
-    return s, one(s), zero(s)
+    return s, one(s), _simgrad_beta(sf, typeof(s))
 end
 
-@inline function simgrad_aux(::DistanceSimilarity, q, k, Cr, Ci, b, C::Int32)
+@inline function simgrad_aux(sf::DistanceSimilarity, q, k, Cr, Ci, b, C::Int32)
     s = simval(DistanceSimilarity(), q, k, Cr, Ci, b, C)
-    return s, one(s), -one(s)
+    return s, one(s), _simgrad_beta(sf, typeof(s))
 end
 
-@inline function simgrad_aux(::PIDotSimilarity, q, k, Cr, Ci, b, C::Int32)
+@inline function simgrad_aux(sf::PIDotSimilarity, q, k, Cr, Ci, b, C::Int32)
     z = simval(DotSimilarity(), q, k, Cr, Ci, b, C)
     s = abs(z)
-    return s, sign(z), zero(s)
+    return s, sign(z), _simgrad_beta(sf, typeof(s))
 end
 
-@inline function simgrad_aux(::PIDistanceSimilarity, q, k, Cr, Ci, b, C::Int32)
+@inline function simgrad_aux(sf::PIDistanceSimilarity, q, k, Cr, Ci, b, C::Int32)
     Ts = promote_type(eltype(q), eltype(k))
     s_xx = zero(real(Ts)); s_xy = zero(Ts); s_yy = zero(real(Ts))
     @inbounds for m in 1i32:C
@@ -147,7 +185,7 @@ end
         s_yy += abs2(km)
     end
     s = -real(Ts)(0.5) * (s_xx + s_yy) + abs(s_xy)
-    return s, sign(s_xy), -one(real(Ts))
+    return s, sign(s_xy), _simgrad_beta(sf, real(Ts))
 end
 
 # g[r,i] = Re⟨Δ[r,:], v[i,:]⟩ — the ∂A entry of the A ⊠ V pullback.
@@ -173,19 +211,18 @@ end
     δ_a   = @inbounds δ[a, b]
 
     # sweep 1: a as row — entries (row a, col i) accumulate ∂q[a,:]
+    zqk = zero(Tqk)
+    zΔ  = zero(TΔ)
     c0 = 0i32
     while c0 < C
-        acc = ntuple(_ -> zero(Tqk), Val(CH))
+        acc = ntuple(_ -> zqk, Val(CH))
         for κ in 1i32:K
             i, _ = cartesian_circulant(base + κ, spatdims, W)
             Ci = @inbounds CartInd[i]
             s, α, β = simgrad_aux(simfun, q, k, Ca, Ci, b, C)
             P  = exp(s - lse_a)
             ds = P * (_flash_gval(Δ, v, Ca, Ci, b, Cv) - δ_a)
-            acc = ntuple(Val(CH)) do t
-                c = c0 + Int32(t)
-                c <= C ? acc[t] + ds * (α * @inbounds(k[Ci, c, b]) + β * @inbounds(q[Ca, c, b])) : acc[t]
-            end
+            acc = _chunk_simgrad(acc, ds, α, β, k, Ci, q, Ca, b, c0, C)
         end
         for t in 1:CH
             c = c0 + Int32(t)
@@ -200,22 +237,16 @@ end
     Cmax = max(C, Cv)
     c0 = 0i32
     while c0 < Cmax
-        acck = ntuple(_ -> zero(Tqk), Val(CH))
-        accv = ntuple(_ -> zero(TΔ), Val(CH))
+        acck = ntuple(_ -> zqk, Val(CH))
+        accv = ntuple(_ -> zΔ, Val(CH))
         for κ in 1i32:K
             r, _ = cartesian_circulant(base + κ, spatdims, W)
             Cr = @inbounds CartInd[r]
             s, α, β = simgrad_aux(simfun, q, k, Cr, Ca, b, C)
             P  = exp(s - @inbounds(lse[r, b]))
             ds = P * (_flash_gval(Δ, v, Cr, Ca, b, Cv) - @inbounds(δ[r, b]))
-            acck = ntuple(Val(CH)) do t
-                c = c0 + Int32(t)
-                c <= C ? acck[t] + ds * (conj(α) * @inbounds(q[Cr, c, b]) + β * @inbounds(k[Ca, c, b])) : acck[t]
-            end
-            accv = ntuple(Val(CH)) do t
-                c = c0 + Int32(t)
-                c <= Cv ? muladd(P, @inbounds(Δ[Cr, c, b]), accv[t]) : accv[t]
-            end
+            acck = _chunk_simgrad(acck, ds, conj(α), β, q, Cr, k, Ca, b, c0, C)
+            accv = _chunk_muladd(accv, P, Δ, Cr, b, c0, Cv)
         end
         for t in 1:CH
             c = c0 + Int32(t)
@@ -246,6 +277,483 @@ function circulant_flash_attention_bwd_kernel!(
 end
 
 # ------------------------------------------------------------------
+# warp-cooperative kernels
+#
+# One sub-warp of WS lanes (WS = min(32, nextpow(2, K)), so small 1D windows
+# don't idle 32 lanes) owns one (row, batch) pair. The K window entries are
+# split across lanes (entry e of lane λ is κ = λ + (e-1)·WS, NE = ⌈K/WS⌉ per
+# lane) and their similarities are computed ONCE and kept in registers — the
+# register file is the only storage that scales with K without spilling, and
+# this removes the ⌈C/CH⌉ similarity-recompute factor of the thread kernels.
+# Softmax statistics and per-channel outputs are combined with shfl_xor_sync
+# butterflies (CUDA.jl shuffles handle Complex via shfl_recurse).
+#
+# Memory access: at each channel step the lanes of a sub-warp touch
+# consecutive window columns (contiguous mod wrap) — coalesced — and q[r,c,b]
+# is a warp-uniform load. Each sub-warp uses its own thread mask, so tail
+# groups that exit the grid-stride loop early never participate in a shuffle
+# they aren't named in.
+#
+# Entries with κ > K use a clamped column index (valid memory) and a zeroed
+# weight, so all lanes stay converged through every shuffle.
+# ------------------------------------------------------------------
+
+# butterfly reduction: every lane of the WS-wide segment ends with the result
+@inline function _warp_reduce(op::F, val, mask::UInt32, ::Val{WS}) where {F, WS}
+    δ = Int32(WS) >> 1i32
+    while δ > 0i32
+        val = op(val, shfl_xor_sync(mask, val, δ, Int32(WS)))
+        δ >>= 1i32
+    end
+    return val
+end
+
+@inline function _flash_warp_fwd_group!(
+        y, lse, simfun::AbstractSimilarity, q, k, v,
+        r::Int32, b::Int32, lane::Int32, submask::UInt32,
+        K::Int32, C::Int32, Cv::Int32,
+        spatdims, CartInd, W::Int32, ::Val{WS}, ::Val{NE},
+    ) where {WS, NE}
+    Ts   = simval_dtype(simfun, eltype(q), eltype(k))
+    Tacc = promote_type(Ts, eltype(v))
+    Cr   = @inbounds CartInd[r]
+    base = (r - 1i32) * K
+
+    # this lane's window columns (clamped) and similarities, in registers.
+    # neginf is hoisted as a value: calling typemin on a closure-captured type
+    # variable widens to DataType under GPUCompiler (dynamic invocation).
+    neginf = typemin(Ts)
+    Cis = ntuple(Val(NE)) do e
+        κ = lane + Int32(e-1) * Int32(WS)
+        i = κ <= K ? first(cartesian_circulant(base + κ, spatdims, W)) : 1i32
+        @inbounds CartInd[i]
+    end
+    svals = ntuple(Val(NE)) do e
+        κ = lane + Int32(e-1) * Int32(WS)
+        κ <= K ? simval(simfun, q, k, Cr, Cis[e], b, C) : neginf
+    end
+
+    # sub-warp softmax statistics
+    m_lane = typemin(Ts)
+    for e in 1:NE
+        m_lane = max(m_lane, svals[e])
+    end
+    m = _warp_reduce(max, m_lane, submask, Val(WS))
+    l_lane = zero(Ts)
+    for e in 1:NE
+        l_lane += exp(svals[e] - m)
+    end
+    l = _warp_reduce(+, l_lane, submask, Val(WS))
+    linv = inv(l)
+    if lane == 1i32
+        @inbounds lse[r, b] = m + log(l)
+    end
+
+    wvals = ntuple(e -> exp(svals[e] - m) * linv, Val(NE))
+
+    # per channel: lane partial, butterfly reduce, lane 1 writes
+    c = 1i32
+    while c <= Cv
+        p = zero(Tacc)
+        for e in 1:NE
+            p = muladd(wvals[e], @inbounds(v[Cis[e], c, b]), p)
+        end
+        p = _warp_reduce(+, p, submask, Val(WS))
+        if lane == 1i32
+            @inbounds y[Cr, c, b] = p
+        end
+        c += 1i32
+    end
+    return nothing
+end
+
+function circulant_flash_attention_warp_kernel!(
+        y, lse, simfun::AbstractSimilarity, q, k, v,
+        nrows::Int32, K::Int32, C::Int32, Cv::Int32,
+        spatdims, CartInd, W::Int32, ngroups::Int32,
+        ws::Val{WS}, ne::Val{NE},
+    ) where {WS, NE}
+    tid     = (blockIdx().x - 1i32) * blockDim().x + threadIdx().x
+    lane    = (tid - 1i32) % Int32(WS) + 1i32
+    g       = (tid - 1i32) ÷ Int32(WS) + 1i32
+    gstride = (gridDim().x * blockDim().x) ÷ Int32(WS)
+    # blockDim is a multiple of 32, so WS-wide segments never straddle a warp
+    hwlane  = (threadIdx().x - 1i32) % 32i32
+    submask = WS == 32 ? 0xffffffff : ((UInt32(1) << WS) - UInt32(1)) << ((hwlane ÷ Int32(WS)) * Int32(WS))
+
+    while g <= ngroups
+        r = (g - 1i32) % nrows + 1i32
+        b = (g - 1i32) ÷ nrows + 1i32
+        _flash_warp_fwd_group!(y, lse, simfun, q, k, v, r, b, lane, submask, K, C, Cv, spatdims, CartInd, W, ws, ne)
+        g += gstride
+    end
+    return nothing
+end
+
+@inline function _flash_warp_bwd_group!(
+        dq, dk, dv, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
+        a::Int32, b::Int32, lane::Int32, submask::UInt32,
+        K::Int32, C::Int32, Cv::Int32,
+        spatdims, CartInd, W::Int32, ::Val{WS}, ::Val{NE},
+    ) where {WS, NE}
+    Ts  = simval_dtype(simfun, eltype(q), eltype(k))
+    Tqk = promote_type(eltype(q), eltype(k))
+    TΔ  = eltype(Δ)
+    β   = _simgrad_beta(simfun, Tqk)
+    Ca   = @inbounds CartInd[a]
+    base = (a - 1i32) * K
+    lse_a = @inbounds lse[a, b]
+    δ_a   = @inbounds δ[a, b]
+
+    # window columns of row a — by pattern symmetry also the rows whose
+    # window contains column a (cols: linear, for lse/δ; Cis: cartesian)
+    cols = ntuple(Val(NE)) do e
+        κ = lane + Int32(e-1) * Int32(WS)
+        κ <= K ? first(cartesian_circulant(base + κ, spatdims, W)) : 1i32
+    end
+    Cis = ntuple(e -> (@inbounds CartInd[cols[e]]), Val(NE))
+
+    # ---- sweep 1: a as row — per-entry (ds·α, ds), then ∂q[a,:] ----------
+    # ∂q[a,c] = Σ_e ds_e α_e k[i_e,c]  +  β q[a,c] Σ_e ds_e
+    sw1 = ntuple(Val(NE)) do e
+        κ = lane + Int32(e-1) * Int32(WS)
+        s, α, _ = simgrad_aux(simfun, q, k, Ca, Cis[e], b, C)
+        P  = exp(s - lse_a)
+        ds = P * (_flash_gval(Δ, v, Ca, Cis[e], b, Cv) - δ_a)
+        valid = κ <= K
+        (valid ? ds * α : zero(ds * α), valid ? ds : zero(ds))
+    end
+    ds1_lane = zero(real(Ts))
+    for e in 1:NE
+        ds1_lane += sw1[e][2]
+    end
+    ds1 = _warp_reduce(+, ds1_lane, submask, Val(WS))
+
+    c = 1i32
+    while c <= C
+        p = zero(Tqk)
+        for e in 1:NE
+            p += sw1[e][1] * @inbounds(k[Cis[e], c, b])
+        end
+        p = _warp_reduce(+, p, submask, Val(WS))
+        if lane == 1i32
+            @inbounds dq[Ca, c, b] = p + β * ds1 * @inbounds(q[Ca, c, b])
+        end
+        c += 1i32
+    end
+
+    # ---- sweep 2: a as column — per-entry (ds·conj(α), P, ds) -------------
+    # ∂k[a,c] = Σ_e ds_e conj(α_e) q[r_e,c] + β k[a,c] Σ_e ds_e
+    # ∂v[a,c] = Σ_e P_e Δ[r_e,c]
+    sw2 = ntuple(Val(NE)) do e
+        κ = lane + Int32(e-1) * Int32(WS)
+        s, α, _ = simgrad_aux(simfun, q, k, Cis[e], Ca, b, C)
+        P  = exp(s - @inbounds(lse[cols[e], b]))
+        ds = P * (_flash_gval(Δ, v, Cis[e], Ca, b, Cv) - @inbounds(δ[cols[e], b]))
+        valid = κ <= K
+        (valid ? ds * conj(α) : zero(ds * α), valid ? P : zero(P), valid ? ds : zero(ds))
+    end
+    ds2_lane = zero(real(Ts))
+    for e in 1:NE
+        ds2_lane += sw2[e][3]
+    end
+    ds2 = _warp_reduce(+, ds2_lane, submask, Val(WS))
+
+    Cmax = max(C, Cv)
+    c = 1i32
+    while c <= Cmax
+        pk = zero(Tqk)
+        pv = zero(TΔ)
+        for e in 1:NE
+            if c <= C
+                pk += sw2[e][1] * @inbounds(q[Cis[e], c, b])
+            end
+            if c <= Cv
+                pv = muladd(sw2[e][2], @inbounds(Δ[Cis[e], c, b]), pv)
+            end
+        end
+        pk = _warp_reduce(+, pk, submask, Val(WS))
+        pv = _warp_reduce(+, pv, submask, Val(WS))
+        if lane == 1i32
+            c <= C  && (@inbounds dk[Ca, c, b] = pk + β * ds2 * @inbounds(k[Ca, c, b]))
+            c <= Cv && (@inbounds dv[Ca, c, b] = pv)
+        end
+        c += 1i32
+    end
+    return nothing
+end
+
+function circulant_flash_attention_bwd_warp_kernel!(
+        dq, dk, dv, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
+        nrows::Int32, K::Int32, C::Int32, Cv::Int32,
+        spatdims, CartInd, W::Int32, ngroups::Int32,
+        ws::Val{WS}, ne::Val{NE},
+    ) where {WS, NE}
+    tid     = (blockIdx().x - 1i32) * blockDim().x + threadIdx().x
+    lane    = (tid - 1i32) % Int32(WS) + 1i32
+    g       = (tid - 1i32) ÷ Int32(WS) + 1i32
+    gstride = (gridDim().x * blockDim().x) ÷ Int32(WS)
+    hwlane  = (threadIdx().x - 1i32) % 32i32
+    submask = WS == 32 ? 0xffffffff : ((UInt32(1) << WS) - UInt32(1)) << ((hwlane ÷ Int32(WS)) * Int32(WS))
+
+    while g <= ngroups
+        a = (g - 1i32) % nrows + 1i32
+        b = (g - 1i32) ÷ nrows + 1i32
+        _flash_warp_bwd_group!(dq, dk, dv, simfun, q, k, v, Δ, lse, δ, a, b, lane, submask, K, C, Cv, spatdims, CartInd, W, ws, ne)
+        g += gstride
+    end
+    return nothing
+end
+
+# ------------------------------------------------------------------
+# block-per-row shared-memory kernels
+#
+# For windows too large for the warp kernels' register budget
+# (K > 32·_FLASH_WARP_MAX_NE), a whole block owns each (row, batch) pair and
+# the per-entry state lives in dynamic shared memory instead of registers:
+#
+#   phase 1: threads cooperatively compute the K similarities (entry κ of
+#            thread t is κ = t, t+TB, …), stage weights and column indices in
+#            shared memory, and combine softmax statistics with a two-level
+#            block reduction (warp butterflies + a 32-slot scratch array).
+#   phase 2: each warp takes channels c = wid, wid+nwarps, …; its lanes split
+#            the window reading weights from shared (conflict-free: lane λ
+#            reads κ = λ, λ+32, …) with v coalesced over κ, and combine with a
+#            warp butterfly.
+#
+# The similarity sweep runs exactly once (like the warp kernels) and the
+# launch puts TB threads on every row, so occupancy stays high for any K.
+# The backward stages ds·α / ds·conj(α) / P the same way, two sweeps as usual.
+# ------------------------------------------------------------------
+
+# eltype of the staged backward weights ds·α (host needs it for shmem sizing)
+@inline _flash_alpha_type(::Union{DotSimilarity, RealDotSimilarity, DistanceSimilarity}, ::Type{Tqk}) where Tqk = real(Tqk)
+@inline _flash_alpha_type(::Union{PIDotSimilarity, PIDistanceSimilarity}, ::Type{Tqk}) where Tqk = Tqk
+
+@inline function _flash_bwd_wtypes(simfun::AbstractSimilarity, ::Type{Tq}, ::Type{Tk}, ::Type{TΔ}, ::Type{Tv}) where {Tq, Tk, TΔ, Tv}
+    Ts  = simval_dtype(simfun, Tq, Tk)
+    Tds = promote_type(Ts, real(promote_type(TΔ, Tv)))
+    Tw  = promote_type(Tds, _flash_alpha_type(simfun, promote_type(Tq, Tk)))
+    return Ts, Tds, Tw
+end
+
+# two-level block reduction; every thread returns the result. Uniform across
+# the block (contains sync_threads); scratch is a 32-slot shared array.
+@inline function _block_reduce(op::F, val::T, neutral::T, scratch) where {F, T}
+    lane = (threadIdx().x - 1i32) % 32i32 + 1i32
+    wid  = (threadIdx().x - 1i32) ÷ 32i32 + 1i32
+    val = _warp_reduce(op, val, 0xffffffff, Val(32))
+    if lane == 1i32
+        @inbounds scratch[wid] = val
+    end
+    sync_threads()
+    nw = (blockDim().x + 31i32) ÷ 32i32
+    if wid == 1i32
+        u = lane <= nw ? @inbounds(scratch[lane]) : neutral
+        u = _warp_reduce(op, u, 0xffffffff, Val(32))
+        if lane == 1i32
+            @inbounds scratch[1] = u
+        end
+    end
+    sync_threads()
+    out = @inbounds scratch[1]
+    sync_threads()  # scratch reusable after return
+    return out
+end
+
+function circulant_flash_attention_block_kernel!(
+        y, lse, simfun::AbstractSimilarity, q, k, v,
+        nrows::Int32, K::Int32, C::Int32, Cv::Int32,
+        spatdims, CartInd, W::Int32, ngroups::Int32,
+    )
+    Ts   = simval_dtype(simfun, eltype(q), eltype(k))
+    Tacc = promote_type(Ts, eltype(v))
+    w_sh    = CuDynamicSharedArray(Ts, K)
+    col_sh  = CuDynamicSharedArray(Int32, K, Int(K) * sizeof(Ts))
+    scratch = CuStaticSharedArray(Ts, 32)
+
+    tid    = threadIdx().x
+    TB     = blockDim().x
+    lane   = (tid - 1i32) % 32i32 + 1i32
+    wid    = (tid - 1i32) ÷ 32i32 + 1i32
+    nwarps = TB ÷ 32i32
+    neginf = typemin(Ts)
+
+    g = blockIdx().x
+    while g <= ngroups
+        r = (g - 1i32) % nrows + 1i32
+        b = (g - 1i32) ÷ nrows + 1i32
+        Cr   = @inbounds CartInd[r]
+        base = (r - 1i32) * K
+
+        # phase 1: similarities into shared, block softmax statistics
+        mloc = neginf
+        κ = tid
+        while κ <= K
+            i, _ = cartesian_circulant(base + κ, spatdims, W)
+            s = simval(simfun, q, k, Cr, @inbounds(CartInd[i]), b, C)
+            @inbounds w_sh[κ]   = s
+            @inbounds col_sh[κ] = i
+            mloc = max(mloc, s)
+            κ += TB
+        end
+        m = _block_reduce(max, mloc, neginf, scratch)
+
+        lloc = zero(Ts)
+        κ = tid
+        while κ <= K
+            e = exp(@inbounds(w_sh[κ]) - m)
+            @inbounds w_sh[κ] = e
+            lloc += e
+            κ += TB
+        end
+        l = _block_reduce(+, lloc, zero(Ts), scratch)
+        linv = inv(l)
+        κ = tid
+        while κ <= K
+            @inbounds w_sh[κ] *= linv
+            κ += TB
+        end
+        if tid == 1i32
+            @inbounds lse[r, b] = m + log(l)
+        end
+        sync_threads()
+
+        # phase 2: warps over channels, lanes over window entries
+        c = wid
+        while c <= Cv
+            p = zero(Tacc)
+            κ = lane
+            while κ <= K
+                p = muladd(@inbounds(w_sh[κ]), @inbounds(v[CartInd[col_sh[κ]], c, b]), p)
+                κ += 32i32
+            end
+            p = _warp_reduce(+, p, 0xffffffff, Val(32))
+            if lane == 1i32
+                @inbounds y[Cr, c, b] = p
+            end
+            c += nwarps
+        end
+        sync_threads()  # shared safe to overwrite for the next group
+        g += gridDim().x
+    end
+    return nothing
+end
+
+function circulant_flash_attention_bwd_block_kernel!(
+        dq, dk, dv, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
+        nrows::Int32, K::Int32, C::Int32, Cv::Int32,
+        spatdims, CartInd, W::Int32, ngroups::Int32,
+    )
+    Tq = eltype(q); Tk = eltype(k); TΔ = eltype(Δ)
+    Ts, Tds, Tw = _flash_bwd_wtypes(simfun, Tq, Tk, TΔ, eltype(v))
+    Tqk = promote_type(Tq, Tk)
+    β   = _simgrad_beta(simfun, Tqk)
+    # largest-aligned first: u (Tw), P (Ts), cols (Int32)
+    u_sh    = CuDynamicSharedArray(Tw, K)
+    P_sh    = CuDynamicSharedArray(Ts, K, Int(K) * sizeof(Tw))
+    col_sh  = CuDynamicSharedArray(Int32, K, Int(K) * (sizeof(Tw) + sizeof(Ts)))
+    scratch = CuStaticSharedArray(Tds, 32)
+
+    tid    = threadIdx().x
+    TB     = blockDim().x
+    lane   = (tid - 1i32) % 32i32 + 1i32
+    wid    = (tid - 1i32) ÷ 32i32 + 1i32
+    nwarps = TB ÷ 32i32
+
+    g = blockIdx().x
+    while g <= ngroups
+        a = (g - 1i32) % nrows + 1i32
+        b = (g - 1i32) ÷ nrows + 1i32
+        Ca   = @inbounds CartInd[a]
+        base = (a - 1i32) * K
+        lse_a = @inbounds lse[a, b]
+        δ_a   = @inbounds δ[a, b]
+
+        κ = tid
+        while κ <= K
+            i, _ = cartesian_circulant(base + κ, spatdims, W)
+            @inbounds col_sh[κ] = i
+            κ += TB
+        end
+        sync_threads()
+
+        # ---- sweep 1: a as row — stage ds·α, then ∂q[a,:] -----------------
+        dsloc = zero(Tds)
+        κ = tid
+        while κ <= K
+            Ci = @inbounds CartInd[col_sh[κ]]
+            s, α, _ = simgrad_aux(simfun, q, k, Ca, Ci, b, C)
+            P  = exp(s - lse_a)
+            ds = P * (_flash_gval(Δ, v, Ca, Ci, b, Cv) - δ_a)
+            @inbounds u_sh[κ] = ds * α
+            dsloc += ds
+            κ += TB
+        end
+        ds1 = _block_reduce(+, dsloc, zero(Tds), scratch)
+
+        c = wid
+        while c <= C
+            p = zero(Tqk)
+            κ = lane
+            while κ <= K
+                p += @inbounds(u_sh[κ]) * @inbounds(k[CartInd[col_sh[κ]], c, b])
+                κ += 32i32
+            end
+            p = _warp_reduce(+, p, 0xffffffff, Val(32))
+            if lane == 1i32
+                @inbounds dq[Ca, c, b] = p + β * ds1 * @inbounds(q[Ca, c, b])
+            end
+            c += nwarps
+        end
+        sync_threads()  # u_sh reads done before sweep 2 overwrites
+
+        # ---- sweep 2: a as column — stage ds·conj(α) and P, then ∂k, ∂v ---
+        dsloc = zero(Tds)
+        κ = tid
+        while κ <= K
+            Cr = @inbounds CartInd[col_sh[κ]]
+            s, α, _ = simgrad_aux(simfun, q, k, Cr, Ca, b, C)
+            P  = exp(s - @inbounds(lse[col_sh[κ], b]))
+            ds = P * (_flash_gval(Δ, v, Cr, Ca, b, Cv) - @inbounds(δ[col_sh[κ], b]))
+            @inbounds u_sh[κ] = ds * conj(α)
+            @inbounds P_sh[κ] = P
+            dsloc += ds
+            κ += TB
+        end
+        ds2 = _block_reduce(+, dsloc, zero(Tds), scratch)
+
+        Cmax = max(C, Cv)
+        c = wid
+        while c <= Cmax
+            pk = zero(Tqk)
+            pv = zero(TΔ)
+            κ = lane
+            while κ <= K
+                Cc = @inbounds CartInd[col_sh[κ]]
+                if c <= C
+                    pk += @inbounds(u_sh[κ]) * @inbounds(q[Cc, c, b])
+                end
+                if c <= Cv
+                    pv = muladd(@inbounds(P_sh[κ]), @inbounds(Δ[Cc, c, b]), pv)
+                end
+                κ += 32i32
+            end
+            pk = _warp_reduce(+, pk, 0xffffffff, Val(32))
+            pv = _warp_reduce(+, pv, 0xffffffff, Val(32))
+            if lane == 1i32
+                c <= C  && (@inbounds dk[Ca, c, b] = pk + β * ds2 * @inbounds(k[Ca, c, b]))
+                c <= Cv && (@inbounds dv[Ca, c, b] = pv)
+            end
+            c += nwarps
+        end
+        sync_threads()
+        g += gridDim().x
+    end
+    return nothing
+end
+
+# ------------------------------------------------------------------
 # host-side launchers (inputs already scaled)
 # ------------------------------------------------------------------
 
@@ -261,10 +769,52 @@ function _flash_launch_dims(q::AbstractArray{Tq,N}, W::Int) where {Tq,N}
     return spatdims, CartInd, nrows, K, maxidx
 end
 
+# Sub-warp width and entries-per-lane. Beyond _FLASH_WARP_MAX_NE registers of
+# window state per lane (K > 1024) the block-per-row kernels take over.
+const _FLASH_WARP_MAX_NE = 32
+
+# dynamic shared memory budget for the block kernels (default 48KB per block,
+# minus headroom for the 32-slot static reduction scratch)
+const _FLASH_BLOCK_MAX_SHMEM = 47 * 1024
+const _FLASH_BLOCK_THREADS = 256
+
+function _flash_warp_dims(K::Int32)
+    WS = min(32, nextpow(2, Int(K)))
+    NE = cld(Int(K), WS)
+    return WS, NE
+end
+
+# Kernel selection: warp while the window fits in lane registers, then block
+# while the staged window fits in shared memory, then thread-per-row.
+function _flash_mode(mode::Symbol, NE::Int, shmem::Int)
+    mode === :auto || return mode
+    NE <= _FLASH_WARP_MAX_NE     && return :warp
+    shmem <= _FLASH_BLOCK_MAX_SHMEM && return :block
+    return :thread
+end
+
+function _flash_block_launch(kernelfn::F, args, ngroups::Int32, shmem::Int) where F
+    kernel = @cuda launch=false kernelfn(args...)
+    kernel(args...; threads=_FLASH_BLOCK_THREADS, blocks=Int(ngroups), shmem=shmem)
+    return nothing
+end
+
+# Launch a warp-cooperative kernel: ngroups sub-warps of WS lanes, block size a
+# multiple of 32 (so segments never straddle warps), grid-stride over groups.
+function _flash_warp_launch(kernelfn::F, args, ngroups::Int32, WS::Int) where F
+    kernel = @cuda launch=false kernelfn(args...)
+    config = launch_configuration(kernel.fun)
+    threads = max(32, min(256, (config.threads ÷ 32) * 32))
+    blocks  = cld(Int(ngroups) * WS, threads)
+    kernel(args...; threads=threads, blocks=blocks)
+    return nothing
+end
+
 function _circulant_flash_attention_fwd(
         simfun::AbstractSimilarity,
         q::AnyCuArray{Tq,N}, k::AnyCuArray{Tk,N}, v::AnyCuArray{Tv,N},
-        W::Int,
+        W::Int;
+        mode::Symbol=:auto,
     ) where {Tq, Tk, Tv, N}
     Ts = simval_dtype(simfun, Tq, Tk)
     Ts <: Real || throw(ArgumentError(
@@ -282,15 +832,25 @@ function _circulant_flash_attention_fwd(
     C   = Int32(size(q, N-1))
     Cv  = Int32(size(v, N-1))
     lse = similar(q, Ts, (Int(nrows), size(q, N)))
-    chunk = _flash_chunk(Tacc)
+    WS, NE = _flash_warp_dims(K)
+    shmem  = Int(K) * (sizeof(Ts) + sizeof(Int32))
+    usemode = _flash_mode(mode, NE, shmem)
 
-    args = (y, lse, simfun, q, k, v, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx, chunk)
-    kernel = @cuda launch=false circulant_flash_attention_kernel!(args...)
-    config = launch_configuration(kernel.fun)
-    threads = min(maxidx, config.threads)
-    blocks  = cld(maxidx, threads)
-
-    kernel(args...; threads=threads, blocks=blocks)
+    if usemode === :warp
+        args = (y, lse, simfun, q, k, v, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx, Val(WS), Val(NE))
+        _flash_warp_launch(circulant_flash_attention_warp_kernel!, args, maxidx, WS)
+    elseif usemode === :block
+        args = (y, lse, simfun, q, k, v, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx)
+        _flash_block_launch(circulant_flash_attention_block_kernel!, args, maxidx, shmem)
+    else
+        chunk = _flash_chunk(Tacc)
+        args = (y, lse, simfun, q, k, v, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx, chunk)
+        kernel = @cuda launch=false circulant_flash_attention_kernel!(args...)
+        config = launch_configuration(kernel.fun)
+        threads = min(maxidx, config.threads)
+        blocks  = cld(maxidx, threads)
+        kernel(args...; threads=threads, blocks=blocks)
+    end
     return y, lse
 end
 
@@ -302,7 +862,8 @@ function ∇circulant_flash_attention(
         simfun::AbstractSimilarity,
         Δ::AnyCuArray{TΔ,N}, y, lse,
         q::AnyCuArray{Tq,N}, k::AnyCuArray{Tk,N}, v::AnyCuArray{Tv,N},
-        W::Int,
+        W::Int;
+        mode::Symbol=:auto,
     ) where {TΔ, Tq, Tk, Tv, N}
     Tqk = promote_type(Tq, Tk)
     dq = similar(q, Tqk)
@@ -315,15 +876,26 @@ function ∇circulant_flash_attention(
     spatdims, CartInd, nrows, K, maxidx = _flash_launch_dims(q, W)
     C  = Int32(size(q, N-1))
     Cv = Int32(size(v, N-1))
-    chunk = _flash_chunk(promote_type(Tqk, TΔ))
+    WS, NE = _flash_warp_dims(K)
+    Ts, _, Tw = _flash_bwd_wtypes(simfun, Tq, Tk, TΔ, Tv)
+    shmem = Int(K) * (sizeof(Tw) + sizeof(Ts) + sizeof(Int32))
+    usemode = _flash_mode(mode, NE, shmem)
 
-    args = (dq, dk, dv, simfun, q, k, v, Δ, lse, δ, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx, chunk)
-    kernel = @cuda launch=false circulant_flash_attention_bwd_kernel!(args...)
-    config = launch_configuration(kernel.fun)
-    threads = min(maxidx, config.threads)
-    blocks  = cld(maxidx, threads)
-
-    kernel(args...; threads=threads, blocks=blocks)
+    if usemode === :warp
+        args = (dq, dk, dv, simfun, q, k, v, Δ, lse, δ, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx, Val(WS), Val(NE))
+        _flash_warp_launch(circulant_flash_attention_bwd_warp_kernel!, args, maxidx, WS)
+    elseif usemode === :block
+        args = (dq, dk, dv, simfun, q, k, v, Δ, lse, δ, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx)
+        _flash_block_launch(circulant_flash_attention_bwd_block_kernel!, args, maxidx, shmem)
+    else
+        chunk = _flash_chunk(promote_type(Tqk, TΔ))
+        args = (dq, dk, dv, simfun, q, k, v, Δ, lse, δ, nrows, K, C, Cv, spatdims, CartInd, Int32(W), maxidx, chunk)
+        kernel = @cuda launch=false circulant_flash_attention_bwd_kernel!(args...)
+        config = launch_configuration(kernel.fun)
+        threads = min(maxidx, config.threads)
+        blocks  = cld(maxidx, threads)
+        kernel(args...; threads=threads, blocks=blocks)
+    end
     return dq, dk, dv
 end
 

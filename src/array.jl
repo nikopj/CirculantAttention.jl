@@ -24,12 +24,51 @@ function Adapt.adapt_structure(to, A::Circulant{T, N, M}) where {T, N, M}
     Circulant(Adapt.adapt_structure(to, A.data), M, A.spatial_size)
 end
 
-# function Adapt.adapt_structure(to::CUDA.KernelAdaptor, A::CuSparseArrayCSR{T,Ti,N}) where {T,Ti,N}
-#     rowPtr = Adapt.adapt(to, A.rowPtr)
-#     colVal = Adapt.adapt(to, A.colVal)
-#     nzVal  = Adapt.adapt(to, A.nzVal)
-#     GPUArrays.GPUSparseDeviceArrayCSR{T, Ti, typeof(rowPtr), typeof(nzVal), N, N-1, 1}(rowPtr, colVal, nzVal, size(A), Ti(length(A.nzVal)))
-# end
+# Compat: some CUDA.jl versions (e.g. the CUDACore/cuSPARSE restructure) ship
+# without a KernelAdaptor rule for the batched CuSparseArrayCSR. The generic
+# adapt fallback then silently passes the host array through, and kernels
+# taking a Circulant fail with "passing non-bitstype argument". Define the
+# rule only when missing — defining it unconditionally would overwrite the
+# upstream method on versions that have it (an error under precompilation).
+# The fully-parameterized inner constructor is used because the convenience
+# constructors vary across GPUArrays versions; the last type parameter is the
+# address space (1 = global memory).
+const _KernelAdaptorT  = isdefined(CUDA, :KernelAdaptor) ? CUDA.KernelAdaptor : CUDA.CUDACore.KernelAdaptor
+const _CuDeviceArrayT  = isdefined(CUDA, :CuDeviceArray) ? CUDA.CuDeviceArray : CUDA.CUDACore.CuDeviceArray
+
+# (a) Versions whose adapt rule exists but calls an unparameterized
+# GPUSparseDeviceArrayCSR(rowPtr, colVal, nzVal, dims, nnz) convenience
+# constructor that GPUArrays never defines (only the {Tv,Ti,Vi,Vv,N} form
+# exists): supply the missing constructor, deriving every type parameter
+# (including the address space A) from the device arrays.
+# probe with concrete types — abstract ones can't match methods that
+# constrain type parameters across arguments
+const _ctor_probe = Tuple{_CuDeviceArrayT{Int32,2,1}, _CuDeviceArrayT{Int32,2,1},
+                          _CuDeviceArrayT{Float32,2,1}, NTuple{3,Int}, Int32}
+if isdefined(GPUArrays, :GPUSparseDeviceArrayCSR) &&
+   !hasmethod(GPUArrays.GPUSparseDeviceArrayCSR, _ctor_probe)
+    @eval function GPUArrays.GPUSparseDeviceArrayCSR(
+            rowPtr::$_CuDeviceArrayT{Ti,M,A}, colVal::$_CuDeviceArrayT{Ti,M,A},
+            nzVal::$_CuDeviceArrayT{Tv,M,A}, dims::NTuple{N,Int}, nnz::Integer,
+        ) where {Ti,Tv,M,A,N}
+        GPUArrays.GPUSparseDeviceArrayCSR{Tv, Ti, typeof(rowPtr), typeof(nzVal), N, M, A}(
+            rowPtr, colVal, nzVal, dims, Ti(nnz))
+    end
+end
+
+# (b) Versions missing the batched-CSR adapt rule entirely (the generic adapt
+# fallback then silently passes the host array through and kernels fail with
+# "passing non-bitstype argument"): define the rule.
+if isdefined(GPUArrays, :GPUSparseDeviceArrayCSR) &&
+   !hasmethod(Adapt.adapt_structure, Tuple{_KernelAdaptorT, CuSparseArrayCSR})
+    @eval function Adapt.adapt_structure(to::$_KernelAdaptorT, A::CuSparseArrayCSR{T,Ti,N}) where {T,Ti,N}
+        rowPtr = Adapt.adapt(to, A.rowPtr)
+        colVal = Adapt.adapt(to, A.colVal)
+        nzVal  = Adapt.adapt(to, A.nzVal)
+        GPUArrays.GPUSparseDeviceArrayCSR{T, Ti, typeof(rowPtr), typeof(nzVal), N, N-1, 1}(
+            rowPtr, colVal, nzVal, size(A), Ti(A.nnz))
+    end
+end
 
 CUDA.unsafe_free!(A::Circulant) = CUDA.unsafe_free!(A.data)
 

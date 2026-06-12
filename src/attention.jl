@@ -8,11 +8,11 @@ const BatchedCirculant{T,N,M,S} = Union{
 @doc raw"""
     y, A = circulant_attention(simfun::AbstractSimilarity, q, k, v, W::Int)
 
-Perform circulant attention on `y=Av`, where A is a row-softmax normalized 
+Perform circulant attention on `y=Av`, where A is a row-softmax normalized
 circulant-sparse attention matrix (A = rowsoftmax(S)). Each non-zero entry ``S_{ij}``
-is generated via the similarity function acting on the channel representations of `q` and `k` 
+is generated via the similarity function acting on the channel representations of `q` and `k`
 at (linearly indexed) pixels `i`, `j` (``S_{ij} = \mathrm{simfun}(q_i, k_j)``).
-Adjacency matrix $A$ is generated internal and returned as the 
+Adjacency matrix $A$ is generated internal and returned as the
 second argument. Note: q and k are internally scaled by `sqrt(sqrt(channels))` before being passed to `circulant_adjacency`.
 
 See also [`circulant_adjacency`](@ref), [`circulant_similarity`](@ref), [`DotSimilarity`](@ref), [`DistanceSimilarity`](@ref).
@@ -20,9 +20,10 @@ See also [`circulant_adjacency`](@ref), [`circulant_similarity`](@ref), [`DotSim
 function circulant_attention(simfun::AbstractSimilarity, q::T, k::T, v::T, W::Int) where {Tv, N, T<: AbstractArray{Tv,N}}
     τ = sqrt(Tv(size(k, N-1)))
     A = circulant_adjacency(simfun, q ./ sqrt(τ), k ./ sqrt(τ), W)
-    V = reshape(v, :, size(v)[N-1:end]...)
-    Y = reshape(A, :, :, :) ⊠ V
-    return reshape(Y, size(q)...), A
+    # Apply via ⊗, whose rrule keeps ∂A circulant-sparse. Tracing through a raw
+    # ⊠ would hit NNlib's generic batched_mul pullback, which materializes a
+    # dense N×N×B ∂A (and cannot be converted back to the sparse pattern).
+    return A ⊗ v, A
 end
 circulant_attention(q::T, k::T, v::T, W::Int) where T = circulant_attention(DotSimilarity(), q, k, v, W)
 
@@ -71,7 +72,7 @@ end
 Applies circulant matrix `A` to `x`.
 See also [`circulant_adjacency`](@ref).
 """
-function circulant_attention(A::Circulant{Ta}, x::AbstractArray{Tx}) where {Ta, Tx} 
+function circulant_attention(A::Circulant{Ta}, x::AbstractArray{Tx}) where {Ta, Tx}
     y = similar(x, promote_type(Ta, Tx))
     circulant_attention!(y, A, x)
     return y

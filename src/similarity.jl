@@ -1,4 +1,3 @@
-# NEW SIMILARITY WITH PERFORMANCE REGRESSION 2x OLD Dot SIMILARITY SPEED
 # similarity.jl
 
 abstract type AbstractSimilarity end
@@ -7,6 +6,35 @@ abstract type AbstractSimilarity end
     real(promote_type(Tx, Ty))
 end
 simval_dtype(sf::AbstractSimilarity, ::AbstractArray{Tx}, ::AbstractArray{Ty}) where {Tx, Ty} = simval_dtype(sf, Tx, Ty)
+
+# Strided channel reduction shared by every similarity: applies f(acc, xv, yv)
+# over the C channels of x[Ci,:,b] and y[Cj,:,b] (arrays are (nrows, C, batch)).
+#
+# On LLVM ≥ 17 the automatic loop-strength-reduction of the multidim access
+# x[Ci,m,b] regressed — it recomputes each element's address with a
+# per-iteration `mul.lo.s64` instead of a constant-stride pointer bump (see
+# benchmark/TOOLCHAIN_REGRESSION_REPORT.md), ~1.2–1.8× slower. We hand it
+# linear indices stepped by `nrows` so the pointer increment is explicit. On
+# LLVM 16 the multidim form is already optimal (and the linear form is slower),
+# so we keep it. The branch is resolved at compile time by @static.
+@inline function _strided_reduce(f::F, init, x, y, Ci, Cj, b, M::Int32) where F
+    acc = init
+    @static if Base.libllvm_version >= v"17"
+        nr  = size(x, 1)
+        off = (Int(b) - 1) * nr * size(x, 2)
+        xl  = off + Int(Ci)
+        yl  = off + Int(Cj)
+        @fastmath @inbounds for _ in 1i32:M
+            acc = f(acc, x[xl], y[yl])
+            xl += nr; yl += nr
+        end
+    else
+        @fastmath @inbounds for m in 1i32:M
+            acc = f(acc, x[Ci, m, b], y[Cj, m, b])
+        end
+    end
+    return acc
+end
 
 @doc raw"""
     RealDotSimilarity()
@@ -20,11 +48,7 @@ struct RealDotSimilarity <: AbstractSimilarity end
 end
 @inline function simval(::RealDotSimilarity, x::AbstractArray{Tx}, y::AbstractArray{Ty}, Ci, Cj, b, M::Int32) where {Tx, Ty}
     Ts = real(promote_type(Tx, Ty))
-    s = zero(Ts)
-    @fastmath @inbounds for m=1i32:M
-        s += real(x[Ci, m, b] * conj(y[Cj, m, b]))
-    end
-    return s
+    _strided_reduce((s, xv, yv) -> s + real(xv * conj(yv)), zero(Ts), x, y, Ci, Cj, b, M)
 end
 
 @doc raw"""
@@ -39,10 +63,7 @@ struct DistanceSimilarity <: AbstractSimilarity end
 end
 @inline function simval(::DistanceSimilarity, x::AbstractArray{Tx}, y::AbstractArray{Ty}, Ci, Cj, b, M::Int32) where {Tx, Ty}
     Ts = real(promote_type(Tx, Ty))
-    s = zero(Ts)
-    @fastmath @inbounds for m=1i32:M
-        s -= abs2(x[Ci, m, b] - y[Cj, m, b])
-    end
+    s = _strided_reduce((s, xv, yv) -> s - abs2(xv - yv), zero(Ts), x, y, Ci, Cj, b, M)
     return Ts(0.5) * s
 end
 
@@ -55,10 +76,7 @@ struct PIDotSimilarity <: AbstractSimilarity end
 
 @inline function simval(::PIDotSimilarity, x::AbstractArray{Tx}, y::AbstractArray{Ty}, Ci, Cj, b, M::Int32) where {Tx, Ty}
     Ts = promote_type(Tx, Ty)
-    s = zero(Ts)
-    @fastmath @inbounds for m=1i32:M
-        s += x[Ci, m, b]*conj(y[Cj, m, b])
-    end
+    s = _strided_reduce((s, xv, yv) -> s + xv * conj(yv), zero(Ts), x, y, Ci, Cj, b, M)
     return abs(s)
 end
 
@@ -71,15 +89,12 @@ Phase-invariant distance similarity:
 struct PIDistanceSimilarity <: AbstractSimilarity end
 
 @inline function simval(::PIDistanceSimilarity, x::AbstractArray{Tx}, y::AbstractArray{Ty}, Ci, Cj, b, M::Int32) where {Tx, Ty}
-    Ts = promote_type(Tx, Ty)
-    s_xx = zero(real(Ts)); s_xy = zero(Ts); s_yy = zero(real(Ts))
-    @fastmath @inbounds for m=1i32:M
-        xm = x[Ci, m, b]; ym = y[Cj, m, b]
-        s_xx += abs2(xm)
-        s_xy += xm * conj(ym)
-        s_yy += abs2(ym)
-    end
-    return -real(Ts)(0.5) * s_xx + abs(s_xy) - real(Ts)(0.5) * s_yy
+    Ts = promote_type(Tx, Ty); R = real(Ts)
+    # 3-component accumulator: (Σ|x|², Σ x·conj(y), Σ|y|²)
+    a = _strided_reduce(
+        (a, xv, yv) -> (a[1] + abs2(xv), a[2] + xv * conj(yv), a[3] + abs2(yv)),
+        (zero(R), zero(Ts), zero(R)), x, y, Ci, Cj, b, M)
+    return -R(0.5) * a[1] + abs(a[2]) - R(0.5) * a[3]
 end
 
 @doc raw"""
@@ -94,11 +109,7 @@ struct DotSimilarity <: AbstractSimilarity end
 end
 @inline function simval(sf::DotSimilarity, x::AbstractArray{Tx}, y::AbstractArray{Ty}, Ci, Cj, b, M::Int32) where {Tx, Ty}
     Ts = promote_type(Tx, Ty)
-    s = zero(Ts)
-    @fastmath @inbounds for m=1i32:M
-        s += x[Ci, m, b]*conj(y[Cj, m, b])
-    end
-    return s
+    _strided_reduce((s, xv, yv) -> s + xv * conj(yv), zero(Ts), x, y, Ci, Cj, b, M)
 end
 simval_dtype(::DotSimilarity, Tx::Type, Ty::Type) = promote_type(Tx, Ty)
 
@@ -130,12 +141,16 @@ function circulant_similarity!(
 
     maxidx   = A.data.nnz
     nnzb     = A.data.nnz ÷ Int32(size(A,3))
+    nrows    = Int32(size(A, 1))
+    Krow     = nnzb ÷ nrows                # nnz per row (= W^spatial_dims)
     M        = Int32(size(x, N-1))
-    spatdims = ntuple(i -> Int32(size(x, i)), N-2)
-    CartInd  = CartesianIndices(spatdims)
-    Wi32 = Int32(W)
 
-    args = (A, simfun, x, y, nnzb, M, spatdims, CartInd, Wi32, maxidx)
+    # kernel indexes spatial positions linearly: reshape to (nrows, C, batch)
+    # so simval's x[i,m,b] addresses (spatial, channel, batch) directly
+    xr = reshape(x, :, size(x, N-1), size(x, N))
+    yr = reshape(y, :, size(y, N-1), size(y, N))
+
+    args = (A, simfun, xr, yr, nnzb, M, Krow, maxidx)
     # all-finite kernel (no sentinels, no exp): the fastmath compile flag is
     # safe here and re-enables accumulation-loop reassociation/contraction
     kernel = @cuda launch=false fastmath=true circulant_similarity_kernel!(args...)
@@ -154,9 +169,7 @@ function circulant_similarity_kernel!(
         y,
         nnzb,
         M,
-        spatdims,
-        CartInd,
-        W,
+        Krow,
         maxidx,
     ) where {Tv,Tx,N}
 
@@ -167,12 +180,15 @@ function circulant_similarity_kernel!(
         n = (tid - Int32(1)) % nnzb + Int32(1)
         b = (tid - Int32(1)) ÷ nnzb + Int32(1)
 
-        i, j = cartesian_circulant(n, spatdims, W)
-        # nzVal[n] sits at CSR (row j, col i): x is indexed by the row and y by
-        # the column (S[j,i] = simval(x_j, y_i)), matching the rrules in
-        # rrules.jl and the docstring S_ij = simfun(q_i, k_j).
-        Ci, Cj = CartInd[i], CartInd[j]
-        s = simval(simfun, x, y, Cj, Ci, b, M)
+        # The column index i is already materialized in colVal during
+        # construction, and the row is j = cld(n, Krow). Reading colVal (one
+        # coalesced load) instead of re-deriving (i,j) via cartesian_circulant
+        # (~15 integer div/mod ops) is ~1.1–1.5× faster on A100 (the win shrinks
+        # as W grows and simval memory traffic dominates). nzVal[n] = S[j,i]:
+        # x indexed by row j, y by column i — see rrules.jl / S_ij convention.
+        i = S.data.colVal[n, b]
+        j = cld(n, Krow)
+        s = simval(simfun, x, y, j, i, b, M)
 
         S.data.nzVal[n, b] = s
         tid += stride

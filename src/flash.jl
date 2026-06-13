@@ -187,25 +187,18 @@ end
 end
 
 @inline function simgrad_aux(sf::PIDistanceSimilarity, q, k, r, i, b, C::Int32)
-    Ts = promote_type(eltype(q), eltype(k))
-    s_xx = zero(real(Ts)); s_xy = zero(Ts); s_yy = zero(real(Ts))
-    @fastmath @inbounds for m in 1i32:C
-        qm = q[r, m, b]; km = k[i, m, b]
-        s_xx += abs2(qm)
-        s_xy += qm * conj(km)
-        s_yy += abs2(km)
-    end
-    s = -real(Ts)(0.5) * (s_xx + s_yy) + abs(s_xy)
-    return s, sign(s_xy), _simgrad_beta(sf, real(Ts))
+    Ts = promote_type(eltype(q), eltype(k)); R = real(Ts)
+    a = _strided_reduce(
+        (a, qm, km) -> (a[1] + abs2(qm), a[2] + qm * conj(km), a[3] + abs2(km)),
+        (zero(R), zero(Ts), zero(R)), q, k, r, i, b, C)
+    s = -R(0.5) * (a[1] + a[3]) + abs(a[2])
+    return s, sign(a[2]), _simgrad_beta(sf, R)
 end
 
 # g[r,i] = Re⟨Δ[r,:], v[i,:]⟩ — the ∂A entry of the A ⊠ V pullback.
 @inline function _flash_gval(Δ, v, r, i, b, Cv::Int32)
-    g = zero(real(promote_type(eltype(Δ), eltype(v))))
-    @fastmath @inbounds for c in 1i32:Cv
-        g += real(Δ[r, c, b] * conj(v[i, c, b]))
-    end
-    return g
+    Tg = real(promote_type(eltype(Δ), eltype(v)))
+    _strided_reduce((g, Δv, vv) -> g + real(Δv * conj(vv)), zero(Tg), Δ, v, r, i, b, Cv)
 end
 
 @inline function _flash_attention_bwd_row!(

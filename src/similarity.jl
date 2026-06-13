@@ -20,15 +20,24 @@ simval_dtype(sf::AbstractSimilarity, ::AbstractArray{Tx}, ::AbstractArray{Ty}) w
 @inline function _strided_reduce(f::F, init, x, y, Ci, Cj, b, M::Int32) where F
     acc = init
     @static if Base.libllvm_version >= v"17"
+        # linear indices stepped by nrows, in a hand-rolled while loop. A100
+        # measurements (benchmark/toolchain_regression_mwe.jl): on LLVM18 the
+        # while+linear form is the fastest of for/while × multidim/linear
+        # (1.45× over the regressed for/multidim), and beats for+linear by
+        # 3–5%. The loop FORM alone (while/multidim) does NOT help on NVPTX —
+        # the linear addressing is what dodges the lost strength-reduction.
         nr  = size(x, 1)
         off = (Int(b) - 1) * nr * size(x, 2)
         xl  = off + Int(Ci)
         yl  = off + Int(Cj)
-        @fastmath @inbounds for _ in 1i32:M
+        m   = 1i32
+        @fastmath @inbounds while m <= M
             acc = f(acc, x[xl], y[yl])
-            xl += nr; yl += nr
+            xl += nr; yl += nr; m += 1i32
         end
     else
+        # LLVM ≤ 16 strength-reduces & vectorizes this form optimally (it's the
+        # fastest of all variants there); the linear/while forms are slower.
         @fastmath @inbounds for m in 1i32:M
             acc = f(acc, x[Ci, m, b], y[Cj, m, b])
         end

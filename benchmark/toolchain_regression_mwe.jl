@@ -100,6 +100,55 @@ function dist_kernel_sr!(out, x, y, colval, nrows::Int32, C::Int32, K::Int32, ma
     return nothing
 end
 
+# while/multidim: keep ordinary x[j,m,b] indexing but a hand-rolled while loop
+# instead of `for m in 1:C`. On CPU this collapsed the address-recompute muls
+# (7→2) under LLVM18 — test whether NVPTX behaves the same (would be a simpler
+# fix than the linear-index form: no index arithmetic).
+function dist_kernel_while!(out, x, y, colval, nrows::Int32, C::Int32, K::Int32, maxidx::Int32)
+    tid    = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    stride = gridDim().x * blockDim().x
+    nnzb   = nrows * K
+    @inbounds while tid <= maxidx
+        n = (tid - Int32(1)) % nnzb + Int32(1)
+        b = (tid - Int32(1)) ÷ nnzb + Int32(1)
+        j = cld(n, K)
+        i = colval[n]
+        s = 0.0f0; m = Int32(1)
+        @fastmath while m <= C
+            d = x[j, m, b] - y[i, m, b]
+            s = s - d * d
+            m += Int32(1)
+        end
+        out[n, b] = 0.5f0 * s
+        tid += stride
+    end
+    return nothing
+end
+
+# while/linear: both the loop-form change and the linear-index addressing.
+function dist_kernel_linwhile!(out, x, y, colval, nrows::Int32, C::Int32, K::Int32, maxidx::Int32)
+    tid    = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    stride = gridDim().x * blockDim().x
+    nnzb   = nrows * K
+    nr     = Int(nrows)
+    @inbounds while tid <= maxidx
+        n = (tid - Int32(1)) % nnzb + Int32(1)
+        b = (tid - Int32(1)) ÷ nnzb + Int32(1)
+        j = cld(n, K); i = colval[n]
+        base = (Int(b) - 1) * nr * Int(C)
+        xl = base + Int(j); yl = base + Int(i)
+        s = 0.0f0; m = Int32(1)
+        @fastmath while m <= C
+            d = x[xl] - y[yl]
+            s = s - d * d
+            xl += nr; yl += nr; m += Int32(1)
+        end
+        out[n, b] = 0.5f0 * s
+        tid += stride
+    end
+    return nothing
+end
+
 # circulant column pattern (1D, width K): data-independent, captures the
 # broadcast-row / coalesced-col access pattern without any library.
 function make_colval(nrows::Int, K::Int)
@@ -153,23 +202,29 @@ for W in (5, 15, 25, 35, 45)
 end
 
 log()
-log("=== workaround: manual strength-reduction (dist_kernel_sr!) ===")
-log("    if sr ≈ old dist_kernel! on LLVM16, the win on LLVM18 = the LSR workaround")
-log(rpad("W", 4), rpad("orig(ms)", 11), rpad("sr(ms)", 11), "speedup")
+log("=== 2×2 loop-form × addressing on GPU (NVPTX) — which form dodges the LSR loss? ===")
+log("    forms: for/multidim (orig), while/multidim, for/linear (sr), while/linear")
+log(rpad("W", 4), rpad("for/md", 11), rpad("while/md", 11), rpad("for/lin", 11), rpad("while/lin", 11), "regs(md,wmd,lin,wlin)")
+const _VARIANTS = (dist_kernel!, dist_kernel_while!, dist_kernel_sr!, dist_kernel_linwhile!)
 for W in (15, 25, 35, 45)
     K       = W * W
     colval  = make_colval(NROWS, K)
     out     = CUDA.zeros(Float32, NROWS * K, B)
     maxidx  = Int32(NROWS * K * B)
     args    = (out, x, y, colval, Int32(NROWS), Int32(C), Int32(K), maxidx)
-    k1 = @cuda launch=false fastmath=true dist_kernel!(args...)
-    k2 = @cuda launch=false fastmath=true dist_kernel_sr!(args...)
-    c1 = launch_configuration(k1.fun); t1 = bench(() -> k1(args...; threads=min(Int(maxidx), c1.threads), blocks=cld(Int(maxidx), min(Int(maxidx), c1.threads))))
-    c2 = launch_configuration(k2.fun); t2 = bench(() -> k2(args...; threads=min(Int(maxidx), c2.threads), blocks=cld(Int(maxidx), min(Int(maxidx), c2.threads))))
-    log(rpad(W, 4), rpad(round(t1; digits=3), 11), rpad(round(t2; digits=3), 11),
-        "$(round(t1/t2; digits=2))x  (sr regs=$(CUDA.registers(k2)))")
+    ts = Float64[]; rs = Int[]
+    for kf in _VARIANTS
+        k = @cuda launch=false fastmath=true kf(args...)
+        c = launch_configuration(k.fun); tpb = min(Int(maxidx), c.threads)
+        push!(ts, bench(() -> k(args...; threads=tpb, blocks=cld(Int(maxidx), tpb))))
+        push!(rs, CUDA.registers(k))
+    end
+    log(rpad(W, 4), rpad(round(ts[1]; digits=3), 11), rpad(round(ts[2]; digits=3), 11),
+        rpad(round(ts[3]; digits=3), 11), rpad(round(ts[4]; digits=3), 11),
+        "($(rs[1]),$(rs[2]),$(rs[3]),$(rs[4]))")
     CUDA.unsafe_free!(colval); CUDA.unsafe_free!(out)
 end
+log("    (md=multidim x[j,m,b], lin=linear xl+=nr; lower ms = better)")
 
 log()
 log("=== dist_kernel! block-size sweep at W=45 (should be ~flat) ===")

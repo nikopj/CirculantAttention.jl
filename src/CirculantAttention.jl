@@ -3,7 +3,7 @@ module CirculantAttention
 const CircAtt = CirculantAttention
 export CircAtt
 
-using CUDA, CUDA.cuSPARSE, cuDNN
+using CUDA, CUDA.CUSPARSE, cuDNN
 using CUDA: i32
 using GPUArrays
 import Adapt

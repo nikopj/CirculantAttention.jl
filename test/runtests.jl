@@ -4,7 +4,7 @@ using Zygote
 
 using Adapt
 using LinearAlgebra
-using CUDA, CUDA.cuSPARSE
+using CUDA, CUDA.CUSPARSE
 using NNlib
 using Statistics
 using Random

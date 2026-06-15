@@ -158,6 +158,46 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         y_mh     = circulant_mh_flash_attention(simfun, q, k, v, ws, nheads)
         @test Array(y_mh) ≈ Array(reshape(y_ref, size(v)...))  rtol=1e-4 atol=1e-6
     end
+
+    # transposed flash Γᵀx: validated against the materialized adjacency built
+    # with the same 1/√C scaling the flash forward uses, and via the adjoint
+    # identity ⟨Γv, x⟩ = ⟨v, Γᵀx⟩.
+    for simfun in simfuns
+        @testset "transposed $(typeof(simfun)) [$tag]" begin
+            scale = inv(sqrt(real(elty)(d)))
+            A  = circulant_adjacency(simfun, q .* sqrt(scale), k .* sqrt(scale), ws)
+            x  = CUDA.randn(elty, size(q)...)
+            yt_ref = CircAtt.circulant_transposed_attention(A, x)
+            yt_fl  = circulant_flash_transposed_attention(simfun, q, k, x, ws)
+            @test Array(yt_fl) ≈ Array(yt_ref)  rtol=1e-4 atol=1e-6
+
+            # adjoint property against the flash forward
+            v  = CUDA.randn(elty, size(q)...)
+            Γv = circulant_flash_attention(simfun, q, k, v, ws)
+            @test sum(conj.(v) .* yt_fl) ≈ sum(conj.(Γv) .* x)  rtol=1e-4 atol=1e-6
+        end
+
+        @testset "transposed rrule $(typeof(simfun)) [$tag]" begin
+            test_rrule(CircAtt._circulant_flash_transposed_attention, simfun,
+                q ⊢ CUDA.randn(elty, size(q)...),
+                k ⊢ CUDA.randn(elty, size(k)...),
+                CUDA.randn(elty, size(q)...) ⊢ CUDA.randn(elty, size(q)...),
+                ws;
+                output_tangent=CUDA.randn(elty, size(q)...),
+                rtol=1e-3, atol=1e-5, check_inferred=false)
+        end
+    end
+
+    # multi-head transposed against split-head reference
+    @testset "multi-head transposed [$tag]" begin
+        nheads = 2
+        simfun = DistanceSimilarity()
+        x  = CUDA.randn(elty, size(q)...)
+        qr, kr, xr = CircAtt.splitheads.((q, k, x), nheads)
+        yt_ref = circulant_flash_transposed_attention(simfun, qr, kr, xr, ws)
+        yt_mh  = circulant_mh_flash_transposed_attention(simfun, q, k, x, ws, nheads)
+        @test Array(yt_mh) ≈ Array(reshape(yt_ref, size(x)...))  rtol=1e-4 atol=1e-6
+    end
 end
 
 # unsupported configurations raise informative errors

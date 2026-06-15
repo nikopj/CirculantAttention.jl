@@ -1037,6 +1037,31 @@ function circulant_flash_joint_attention(simfun::AbstractSimilarity, q::T, k::T,
         ntuple(_ -> k, Val(M)), ntuple(_ -> v, Val(M)), Ws)
 end
 
+@doc raw"""
+    ys = circulant_mh_flash_joint_attention(simfuns, qs, ks, vs, Ws, nheads::Int)
+    ys = circulant_mh_flash_joint_attention(simfun, qs, ks, vs, Ws, nheads::Int)
+
+Multi-head version of [`circulant_flash_joint_attention`](@ref): the joint
+softmax is normalized per head over the union of the branches' window entries.
+Heads are folded into the batch dimension (as in
+[`circulant_mh_flash_attention`](@ref)); the joint normalization is independent
+per row, so this is exact. The number of channels must be divisible by `nheads`.
+"""
+function circulant_mh_flash_joint_attention(
+        simfuns::NTuple{M,AbstractSimilarity},
+        qs::NTuple{M}, ks::NTuple{M}, vs::NTuple{M}, Ws::NTuple{M,Int}, nheads::Int,
+    ) where M
+    qrs = map(q -> splitheads(q, nheads), qs)
+    krs = map(k -> splitheads(k, nheads), ks)
+    vrs = map(v -> splitheads(v, nheads), vs)
+    yrs = circulant_flash_joint_attention(simfuns, qrs, krs, vrs, Ws)
+    return map((y, v) -> reshape(y, size(v)...), yrs, vs)
+end
+
+function circulant_mh_flash_joint_attention(simfun::AbstractSimilarity, qs::NTuple{M}, ks::NTuple{M}, vs::NTuple{M}, Ws::NTuple{M,Int}, nheads::Int) where M
+    circulant_mh_flash_joint_attention(ntuple(_ -> simfun, Val(M)), qs, ks, vs, Ws, nheads)
+end
+
 # ------------------------------------------------------------------
 # rrules — fused backward
 # ------------------------------------------------------------------
@@ -1095,3 +1120,107 @@ function CRC.rrule(::typeof(_circulant_flash_attention_lse), simfun::AbstractSim
     flash_attention_lse_pullback6(Δ) = pb7(Δ)[1:6]
     return out, flash_attention_lse_pullback6
 end
+
+# ------------------------------------------------------------------
+# transposed flash attention:  y = Γᵀ x  without materializing Γ
+#
+#   (Γᵀx)_a = Σ_r P_{ra} x_r,   P_{ra} = exp(scale·s_{ra} − L_r),
+#   s_{ra} = simval(q_r, k_a),  L_r = logsumexp_i scale·s_{ri}.
+#
+# This is the adjoint (w.r.t. v) of the forward Γ-apply y = Γv, so it is
+# exactly the `dv` output of the fused backward — which depends only on P and
+# the cotangent, not on v/y/δ. We therefore reuse the already-GPU-tested
+# forward/backward primitives instead of writing a new device kernel:
+#   forward:  L = lse from one fwd pass;  Γᵀx = dv from one bwd pass.
+#   gradient (derived from y_a = Σ_r exp(scale·s_{ra}−L_r) x_r):
+#     ∂x = Γ Δ̄              (forward flash on the cotangent Δ̄)
+#     ∂q,∂k = dq,dk of the fused backward with Δ←x, v←Δ̄, y←ȳ=ΓΔ̄
+#   (the backward's −δ_r softmax-shift term carries L's dependence on q,k, so
+#    the gradient is exact even though L is recomputed rather than threaded).
+#
+# A dedicated fused kernel would avoid the wasted dq/dk/y compute below; this
+# reuse keeps the column-sweep on the tested code path and is used on the
+# multigrid subgradient, not the hot per-iteration prox.
+# ------------------------------------------------------------------
+
+# Γᵀx given the per-row logsumexp `lse` (value-only, no AD).
+function _flash_transposed_from_lse(simfun::AbstractSimilarity, q, k, x, lse, W::Int, scale::Real)
+    zr = zero(x)                                   # y and v are irrelevant to dv
+    _, _, dv = ∇circulant_flash_attention(simfun, x, zr, lse, q, k, zr, W, scale)
+    return dv
+end
+
+function _circulant_flash_transposed_attention(simfun::AbstractSimilarity, q, k, x, W::Int, scale::Real=true)
+    _, lse = _circulant_flash_attention_fwd(simfun, q, k, x, W, scale)
+    return _flash_transposed_from_lse(simfun, q, k, x, lse, W, scale)
+end
+
+function CRC.rrule(::typeof(_circulant_flash_transposed_attention), simfun::AbstractSimilarity, q, k, x, W::Int, scale::Real)
+    _, lse = _circulant_flash_attention_fwd(simfun, q, k, x, W, scale)
+    y = _flash_transposed_from_lse(simfun, q, k, x, lse, W, scale)
+    project_q, project_k, project_x = CRC.ProjectTo(q), CRC.ProjectTo(k), CRC.ProjectTo(x)
+    function flash_transposed_pullback(Δ)
+        Δ̄ = _flash_materialize(Δ, y)
+        ȳ = _circulant_flash_attention(simfun, q, k, Δ̄, W, scale)            # Γ Δ̄  ( = ∂x )
+        ∂q, ∂k, _ = ∇circulant_flash_attention(simfun, x, ȳ, lse, q, k, Δ̄, W, scale)
+        return CRC.NoTangent(), CRC.NoTangent(), project_q(∂q), project_k(∂k), project_x(ȳ), CRC.NoTangent(), CRC.NoTangent()
+    end
+    return y, flash_transposed_pullback
+end
+
+function CRC.rrule(::typeof(_circulant_flash_transposed_attention), simfun::AbstractSimilarity, q, k, x, W::Int)
+    y, pb7 = CRC.rrule(_circulant_flash_transposed_attention, simfun, q, k, x, W, true)
+    flash_transposed_pullback6(Δ) = pb7(Δ)[1:6]
+    return y, flash_transposed_pullback6
+end
+
+@doc raw"""
+    y = circulant_flash_transposed_attention(simfun::AbstractSimilarity, q, k, x, W::Int)
+
+Fused (flash) version of the *transposed* circulant attention apply
+``y = \Gamma^{\!\top} x``, where ``\Gamma = \mathrm{rowsoftmax}(S)`` with
+``S_{ij} = \mathrm{simfun}(q_i, k_j)`` is the same row-softmax attention matrix
+[`circulant_flash_attention`](@ref) applies as ``\Gamma v``. The transpose is
+
+```math
+(\Gamma^{\!\top} x)_a = \sum_r e^{\,s_{ra} - L_r}\, x_r ,\qquad
+L_r = \mathrm{logsumexp}_i\, s_{ri},
+```
+
+i.e. each source row keeps its own softmax normalizer ``L_r`` — so a plain
+``q\leftrightarrow k`` swap does **not** give ``\Gamma^{\!\top}`` (that would
+renormalize over the wrong axis). No attention matrix is materialized;
+gradients w.r.t. `q`, `k`, `x` are exact.
+
+`q`, `k` must share shape; `x` carries the attended channels. The similarity
+must be real-valued (window-renormalizing similarities are not supported).
+
+See also [`circulant_flash_attention`](@ref),
+[`circulant_mh_flash_transposed_attention`](@ref).
+"""
+function circulant_flash_transposed_attention(simfun::AbstractSimilarity, q::T, k::T, x::T, W::Int) where {Tv, N, T<:AbstractArray{Tv,N}}
+    scale = inv(sqrt(real(Tv)(size(k, N-1))))
+    _circulant_flash_transposed_attention(simfun, q, k, x, W, scale)
+end
+circulant_flash_transposed_attention(q::T, k::T, x::T, W::Int) where T = circulant_flash_transposed_attention(DotSimilarity(), q, k, x, W)
+
+function circulant_flash_transposed_attention(simfun::_UnfusableSimilarity, q::T, k::T, x::T, W::Int) where {Tv, N, T<:AbstractArray{Tv,N}}
+    throw(ArgumentError(
+        "$(typeof(simfun)) renormalizes over the full window and cannot be fused; " *
+        "form the adjacency with circulant_adjacency and use circulant_mh_transposed_attention instead."))
+end
+
+@doc raw"""
+    y = circulant_mh_flash_transposed_attention(simfun, q, k, x, W::Int, nheads::Int)
+
+Multi-head version of [`circulant_flash_transposed_attention`](@ref): applies
+the fused transposed attention on `nheads` channel groups separately and
+concatenates along channels. The number of channels must be divisible by
+`nheads`.
+"""
+function circulant_mh_flash_transposed_attention(simfun::AbstractSimilarity, q::T, k::T, x::T, W::Int, nheads::Int) where {Tv, N, T<:AbstractArray{Tv,N}}
+    qr, kr, xr = splitheads.((q, k, x), nheads)
+    yr = circulant_flash_transposed_attention(simfun, qr, kr, xr, W)
+    return reshape(yr, size(x)...)
+end
+circulant_mh_flash_transposed_attention(q::T, k::T, x::T, W::Int, nheads::Int) where T = circulant_mh_flash_transposed_attention(DotSimilarity(), q, k, x, W, nheads)

@@ -60,6 +60,39 @@ function joint_pipeline(simfun, q, k, v, W1, W2)
     return A1 ⊗ v, A2 ⊗ v
 end
 
+# guide tensors stacked guide-fastest as (lead..., G·B); slice guide g → (lead..., B)
+_gslice(x5, g) = x5[ntuple(_ -> Colon(), ndims(x5) - 2)..., g, :]
+
+# STANDARD (non-batched) guided multi-guide joint-softmax attention (mh): one
+# self branch + G guide branches sharing the query, jointly normalized — the
+# Γ-materializing path (mirrors GuidedGroupThreshold), with per-guide slices.
+function guided_pipeline(simfun, qz, kz, vz, kg, vg, Wz, Wg, G, B, nheads)
+    lead = size(kg)[1:ndims(kg)-1]
+    kgr  = reshape(kg, lead..., G, B)
+    vgr  = reshape(vg, lead..., G, B)
+    Sz = CircAtt.circulant_mh_similarity(simfun, qz, kz, Wz, nheads)
+    Sg = ntuple(g -> CircAtt.circulant_mh_similarity(simfun, qz, _gslice(kgr, g), Wg, nheads), G)
+    As = joint_softmax(Sz, Sg...)
+    yz = As[1] ⨷ vz
+    yg = mapreduce(+, 1:G) do g
+        As[g+1] ⨷ _gslice(vgr, g)
+    end
+    return yz, yg
+end
+
+# FLASH but NON-batched: per-guide slices fed to the tuple joint flash kernel
+# (G+1 separate flash launches). Isolates the cost the batched path removes.
+function guided_flash_tuple(simfun, qz, kz, vz, kg, vg, Wz, Wg, G, B, nheads)
+    lead = size(kg)[1:ndims(kg)-1]
+    kgr  = reshape(kg, lead..., G, B)
+    vgr  = reshape(vg, lead..., G, B)
+    qs = (qz, ntuple(_ -> qz, G)...)
+    ks = (kz, ntuple(g -> _gslice(kgr, g), G)...)
+    vs = (vz, ntuple(g -> _gslice(vgr, g), G)...)
+    Ws = (Wz, ntuple(_ -> Wg, G)...)
+    return circulant_mh_flash_joint_attention(simfun, qs, ks, vs, Ws, nheads)
+end
+
 # --------------------------
 # run benchmarks
 # --------------------------
@@ -152,6 +185,26 @@ for elty in ELTYPES, tensorsize in TENSORSIZES, windowsize in WINDOWSIZES
     rec("circulant_flash_joint_attention_gradient", joint_gradflops, () -> Zygote.gradient((q, k, v) -> begin
         ya, yb = circulant_flash_joint_attention(DistanceSimilarity(), q, k, v, Wsj); sum(abs2, ya) + sum(abs2, yb)
     end, x, y, z))
+
+    # guided multi-guide joint attention (nheads=4, G guides, all windows =
+    # windowsize): standard composed (Γ-materialized) vs flash-tuple (G+1
+    # separate launches) vs flash-batched (guides in one flash call).
+    nhg = 4
+    G   = 3
+    global kg, vg
+    kg = CUDA.randn(elty, tensorsize[1:end-1]..., G*B)
+    vg = CUDA.randn(elty, tensorsize[1:end-1]..., G*B)
+    g_flops     = (G + 1) * (B * N * (2*C - 1) * windowsize^2 + B * N * C * (2*windowsize^2 - 1))
+    g_gradflops = 3 * g_flops
+    rec("guided_pipeline",      g_flops, () -> guided_pipeline(DistanceSimilarity(), x, y, z, kg, vg, windowsize, windowsize, G, B, nhg))
+    rec("guided_flash_tuple",   g_flops, () -> guided_flash_tuple(DistanceSimilarity(), x, y, z, kg, vg, windowsize, windowsize, G, B, nhg))
+    rec("guided_flash_batched", g_flops, () -> circulant_mh_flash_guided_joint_attention(DistanceSimilarity(), x, y, z, windowsize, kg, vg, windowsize, G, nhg))
+    rec("guided_pipeline_gradient", g_gradflops, () -> Zygote.gradient((qz, kz, vz, kgg, vgg) -> begin
+        ya, yb = guided_pipeline(DistanceSimilarity(), qz, kz, vz, kgg, vgg, windowsize, windowsize, G, B, nhg); sum(abs2, ya) + sum(abs2, yb)
+    end, x, y, z, kg, vg))
+    rec("guided_flash_batched_gradient", g_gradflops, () -> Zygote.gradient((qz, kz, vz, kgg, vgg) -> begin
+        ya, yb = circulant_mh_flash_guided_joint_attention(DistanceSimilarity(), qz, kz, vz, windowsize, kgg, vgg, windowsize, G, nhg); sum(abs2, ya) + sum(abs2, yb)
+    end, x, y, z, kg, vg))
 
     rec("softmax",       B * N * C * 15 * (2*windowsize^2 - 1 + 1), () -> NNlib.softmax(A))
     rec("joint_softmax", B * N * C * 15 * (2 * 2*windowsize^2 - 1 + 1), () -> CircAtt.joint_softmax(A, A))

@@ -157,3 +157,16 @@ comparison_plot(df,
     ["standard" "flash"],
     "joint-softmax forward+backward: standard vs flash",
     "flash_joint_gradient_comparison")
+
+# guided multi-guide joint attention (nheads=4, 3 guides)
+comparison_plot(df,
+    ["guided_pipeline", "guided_flash_tuple", "guided_flash_batched"],
+    ["standard" "flash (per-guide)" "flash (batched)"],
+    "guided multi-guide forward: standard vs flash",
+    "flash_guided_comparison")
+
+comparison_plot(df,
+    ["guided_pipeline_gradient", "guided_flash_batched_gradient"],
+    ["standard" "flash (batched)"],
+    "guided multi-guide forward+backward: standard vs flash",
+    "flash_guided_gradient_comparison")

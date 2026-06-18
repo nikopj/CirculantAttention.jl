@@ -28,9 +28,12 @@ function bench_gpu(f; samples=50, warmup=3)
     end
     CUDA.synchronize()
 
+    # gcsample=true runs GC before every sample (not counted in the timing) so
+    # dead CuArrays are finalized and the pool can be reused — without it 50
+    # samples of a large allocation pile up in the pool and OOM mid-trial.
     trial = @benchmark begin
         CUDA.@sync $f()
-    end samples=samples evals=1
+    end samples=samples evals=1 gcsample=true
 
     CUDA.synchronize()
 
@@ -208,6 +211,14 @@ for elty in ELTYPES, tensorsize in TENSORSIZES, windowsize in WINDOWSIZES
 
     rec("softmax",       B * N * C * 15 * (2*windowsize^2 - 1 + 1), () -> NNlib.softmax(A))
     rec("joint_softmax", B * N * C * 15 * (2 * 2*windowsize^2 - 1 + 1), () -> CircAtt.joint_softmax(A, A))
+
+    # ── reclaim GPU memory before the next (eltype, windowsize) ──────────
+    # Drop this iteration's arrays, run finalizers so the dead CuArrays return
+    # to the pool, then hand the pooled blocks back to the driver. Without this
+    # the pool keeps every window's peak resident and large windows OOM.
+    x = y = z = A = kg = vg = nothing
+    GC.gc(true)
+    CUDA.reclaim()
 end
 
 println("\nfinished $NITER configs in $(round(Int, time() - t_start))s")

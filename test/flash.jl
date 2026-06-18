@@ -198,6 +198,49 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         yt_mh  = circulant_mh_flash_transposed_attention(simfun, q, k, x, ws, nheads)
         @test Array(yt_mh) ≈ Array(reshape(yt_ref, size(x)...))  rtol=1e-4 atol=1e-6
     end
+
+    # batched guided-joint flash: 1 self + G guides (guides batched in one flash
+    # call) must match the tuple-based circulant_mh_flash_joint_attention over
+    # branches (self, g₁, …, g_G), in both forward and gradient.
+    @testset "guided joint flash [$tag]" begin
+        G = 3; nheads = 2
+        simfun = DistanceSimilarity()
+        Wz, Wg = ws, ws
+        nsd = nspatdims
+        gslice(x5, g) = x5[ntuple(_->Colon(), nsd)..., :, g, :]
+
+        qz = CUDA.randn(elty, spatdims..., d, B)
+        kz = CUDA.randn(elty, spatdims..., d, B)
+        vz = CUDA.randn(elty, spatdims..., d, B)
+        kg = CUDA.randn(elty, spatdims..., d, G*B)   # guide-fastest layout
+        vg = CUDA.randn(elty, spatdims..., d, G*B)
+
+        # tuple reference (built from the same kg/vg via guide slices)
+        ref = (qz, kz, vz, kg, vg) -> begin
+            kgr = reshape(kg, spatdims..., d, G, B)
+            vgr = reshape(vg, spatdims..., d, G, B)
+            qs = (qz, ntuple(_->qz, G)...)
+            ks = (kz, ntuple(g->gslice(kgr, g), G)...)
+            vs = (vz, ntuple(g->gslice(vgr, g), G)...)
+            Ws = (Wz, ntuple(_->Wg, G)...)
+            ys = circulant_mh_flash_joint_attention(simfun, qs, ks, vs, Ws, nheads)
+            return ys[1], reduce(+, ys[2:end])
+        end
+        bat = (qz, kz, vz, kg, vg) ->
+            circulant_mh_flash_guided_joint_attention(simfun, qz, kz, vz, Wz, kg, vg, Wg, G, nheads)
+
+        ξz, ξg = bat(qz, kz, vz, kg, vg)
+        rz, rg = ref(qz, kz, vz, kg, vg)
+        @test Array(ξz) ≈ Array(rz)  rtol=1e-4 atol=1e-6
+        @test Array(ξg) ≈ Array(rg)  rtol=1e-4 atol=1e-6
+
+        loss(f, args...) = ((a, b) = f(args...); sum(abs2, a) + sum(abs2, b))
+        gb = Zygote.gradient((args...) -> loss(bat, args...), qz, kz, vz, kg, vg)
+        gr = Zygote.gradient((args...) -> loss(ref, args...), qz, kz, vz, kg, vg)
+        for (b, r) in zip(gb, gr)
+            @test Array(b) ≈ Array(r)  rtol=1e-3 atol=1e-5
+        end
+    end
 end
 
 # unsupported configurations raise informative errors

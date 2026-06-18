@@ -1062,6 +1062,77 @@ function circulant_mh_flash_joint_attention(simfun::AbstractSimilarity, qs::NTup
     circulant_mh_flash_joint_attention(ntuple(_ -> simfun, Val(M)), qs, ks, vs, Ws, nheads)
 end
 
+# Replicate the batch dimension `G` times, guide-fastest:
+# (lead..., B) → (lead..., G·B) with new index gb = g + (b-1)·G. Matches the
+# layout of a guide tensor `reshape(v, lead..., G, B)`.
+function _replicate_batch(q::AbstractArray{T,N}, G::Integer) where {T,N}
+    lead = size(q)[1:N-1]
+    B    = size(q, N)
+    qe   = reshape(q, lead..., 1, B)
+    qr   = repeat(qe, ntuple(_ -> 1, N-1)..., G, 1)   # (lead..., G, B)
+    return reshape(qr, lead..., G * B)
+end
+
+@doc raw"""
+    ξz, ξg = circulant_mh_flash_guided_joint_attention(simfun, qz, kz, vz, Wz,
+                                                       kg, vg, Wg, num_guides, nheads)
+
+Joint-softmax flash attention for the guided multi-guide proximal map: a single
+self branch (`qz, kz, vz`, window `Wz`) plus `num_guides` guide branches that
+**share the self query** and a common window `Wg`, with the guide keys/values
+stacked along the batch dimension of `kg`/`vg` as `(guide-fastest, base-batch)`
+(`size(kg, end) == num_guides * size(kz, end)`).
+
+Equivalent to [`circulant_mh_flash_joint_attention`](@ref) over the branches
+`(self, g₁, …, g_G)` — the softmax is normalized jointly over the union of the
+self window and all guide windows — but the guides are attended in **one
+batched flash call** instead of one call per guide (and the caller projects
+them once). Returns the self output `ξz` and the summed guide output
+`ξg = Σ_g ξ_g`, each `(spatial..., Cv, B)`.
+
+See also [`circulant_mh_flash_joint_attention`](@ref).
+"""
+function circulant_mh_flash_guided_joint_attention(
+        simfun::AbstractSimilarity,
+        qz::AbstractArray{T,N}, kz::AbstractArray{T,N}, vz::AbstractArray{Tv,N}, Wz::Int,
+        kg::AbstractArray{T,N}, vg::AbstractArray{Tv,N}, Wg::Int,
+        num_guides::Int, nheads::Int) where {T, Tv, N}
+    # self branch (head-folded): yz (sp...,Cvh,nh·B), Lz_flat (nrows, nh·B)
+    qzr, kzr, vzr = splitheads.((qz, kz, vz), nheads)
+    sz = inv(sqrt(real(T)(size(kzr, N-1))))
+    yz, Lz_flat = _circulant_flash_attention_lse(simfun, qzr, kzr, vzr, Wz, sz)
+
+    # guide branch: replicate the shared query across guides and attend them all
+    # in one batched flash; yg (sp...,Cvh,nh·G·B), Lg_flat (nrows, nh·G·B)
+    qg = _replicate_batch(qz, num_guides)
+    qgr, kgr, vgr = splitheads.((qg, kg, vg), nheads)
+    sg = inv(sqrt(real(T)(size(kgr, N-1))))
+    yg, Lg_flat = _circulant_flash_attention_lse(simfun, qgr, kgr, vgr, Wg, sg)
+
+    nrows = size(Lz_flat, 1)
+    B     = size(Lz_flat, 2) ÷ nheads
+    sp    = size(yz)[1:N-2]
+    Cvh   = size(yz, N-1)
+
+    # joint logsumexp over self + G guides, per (row, head, base-batch).
+    # folded batch order is head-fastest then (for guides) guide then base.
+    Lz = reshape(Lz_flat, nrows, nheads, B)
+    Lg = reshape(Lg_flat, nrows, nheads, num_guides, B)
+    m  = max.(Lz, dropdims(maximum(Lg; dims=3); dims=3))             # (nrows,nh,B)
+    m4 = reshape(m, nrows, nheads, 1, B)
+    Lj = m .+ log.(exp.(Lz .- m) .+ dropdims(sum(exp.(Lg .- m4); dims=3); dims=3))
+
+    # reweight (broadcast over channels) and join heads back
+    ωz = reshape(exp.(Lz .- Lj), sp..., 1, nheads * B)
+    ωg = reshape(exp.(Lg .- reshape(Lj, nrows, nheads, 1, B)), sp..., 1, nheads * num_guides * B)
+    ξz = reshape(yz .* ωz, size(vz)...)
+
+    ξg_f   = yg .* ωg                                                # (sp...,Cvh,nh·G·B)
+    ξg_sum = dropdims(sum(reshape(ξg_f, sp..., Cvh, nheads, num_guides, B); dims=N+1); dims=N+1)
+    ξg     = reshape(ξg_sum, size(vz)...)
+    return ξz, ξg
+end
+
 # ------------------------------------------------------------------
 # rrules — fused backward
 # ------------------------------------------------------------------

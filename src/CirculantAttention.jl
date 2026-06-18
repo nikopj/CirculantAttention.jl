@@ -40,7 +40,7 @@ export circulant_attention, circulant_mh_attention, circulant_mh_adjacency, ⊗,
 
 include("flash.jl")
 export circulant_flash_attention, circulant_mh_flash_attention, circulant_flash_joint_attention
-export circulant_mh_flash_joint_attention
+export circulant_mh_flash_joint_attention, circulant_mh_flash_guided_joint_attention
 export circulant_flash_transposed_attention, circulant_mh_flash_transposed_attention
 
 include("batchedmul.jl")

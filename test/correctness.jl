@@ -21,9 +21,15 @@ ref_sim(::DistanceSimilarity, qi, kj) = -sum(abs2, qi .- kj) / 2
 # boundary indexing. Returns (Wv, Cv) :: (Krow, Nrows, B) of stored values and
 # their matching column indices.
 function stored_entries(S::Circulant)
-    Wv = Array(windowview(S))                           # (Krow, Nrows, B)
-    Krow, Nrows, B = size(Wv, 1), size(Wv, 2), size(Wv, 3)
-    Cv = Array(reshape(S.data.colVal, Krow, Nrows, B))  # matching column idx
+    Nrows = size(S, 1)
+    B     = size(S, ndims(S))
+    nz    = Array(S.data.nzVal)                 # (nnz_per_row*Nrows, [chan=1,] B)
+    cv    = Array(S.data.colVal)
+    Krow  = length(nz) ÷ (Nrows * B)            # nnz per row (= W^spatial_dims)
+    # within-row entries are consecutive, so column-major reshape recovers
+    # (entry-in-row, row, batch); the singleton channel dim drops out cleanly.
+    Wv = reshape(nz, Krow, Nrows, B)
+    Cv = reshape(cv, Krow, Nrows, B)
     return Wv, Cv
 end
 
@@ -65,20 +71,19 @@ function attention_output_errs(simfun, q, k, v, W)
     vr = reshape(Array(v), Nrows, C, B)
 
     # Reconstruct A = rowsoftmax(S) and y = A·v on the CPU from A's own pattern.
-    _, Cv = stored_entries(A)
-    A_ref = Array(windowview(A))                    # (Krow, Nrows, B)
+    Aw, Cv = stored_entries(A)                      # Aw = A's nzVal (Krow,Nrows,B)
     y_ref = zeros(Tv, Nrows, C, B)
     A_err = 0.0
     for b in 1:B, i in 1:Nrows
         cols   = Int.(Cv[:, i, b])
         logits = [ref_sim(simfun, qr[i,:,b], kr[j,:,b]) for j in cols]
         wts    = NNlib.softmax(logits)              # row-softmax over the window
-        A_err  = max(A_err, maximum(abs.(A_ref[:, i, b] .- wts)))
+        A_err  = max(A_err, maximum(abs.(Aw[:, i, b] .- wts)))
         for (t, j) in enumerate(cols)
             y_ref[i, :, b] .+= wts[t] .* vr[j, :, b]
         end
     end
-    y_err = maximum(abs.(Array(y) .- y_ref))
+    y_err = maximum(abs.(reshape(Array(y), Nrows, C, B) .- y_ref))
     return A_err, y_err
 end
 
@@ -103,10 +108,15 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
             @test es > 1e-2      # swapped convention is clearly wrong
         end
 
-        @testset "attention output y = rowsoftmax(S)·v [$tag]" begin
-            ae, ye = attention_output_errs(simfun, q, k, v, W)
-            @test ae < 1e-3
-            @test ye < 1e-3
+        # circulant_attention row-softmaxes the similarity values, which is only
+        # defined for real-valued similarities (cuDNN softmax rejects complex).
+        # DotSimilarity on complex inputs yields complex values, so skip it there.
+        if CirculantAttention.simval_dtype(simfun, elty, elty) <: Real
+            @testset "attention output y = rowsoftmax(S)·v [$tag]" begin
+                ae, ye = attention_output_errs(simfun, q, k, v, W)
+                @test ae < 1e-3
+                @test ye < 1e-3
+            end
         end
     end
 end

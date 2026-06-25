@@ -17,15 +17,17 @@ second argument. Note: q and k are internally scaled by `sqrt(sqrt(channels))` b
 
 See also [`circulant_adjacency`](@ref), [`circulant_similarity`](@ref), [`DotSimilarity`](@ref), [`DistanceSimilarity`](@ref).
 """
-function circulant_attention(simfun::AbstractSimilarity, q::T, k::T, v::T, W::Int) where {Tv, N, T<: AbstractArray{Tv,N}}
-    τ = sqrt(Tv(size(k, N-1)))
+function circulant_attention(simfun::AbstractSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, v::AbstractArray{Tv,N}, W::Int) where {Tq, Tk, Tv, N}
+    # q, k, v may have distinct element types (e.g. complex q/k, real v); the
+    # similarity scale is keyed off the query/key channel count.
+    τ = sqrt(real(Tk)(size(k, N-1)))
     A = circulant_adjacency(simfun, q ./ sqrt(τ), k ./ sqrt(τ), W)
     # Apply via ⊗, whose rrule keeps ∂A circulant-sparse. Tracing through a raw
     # ⊠ would hit NNlib's generic batched_mul pullback, which materializes a
     # dense N×N×B ∂A (and cannot be converted back to the sparse pattern).
     return A ⊗ v, A
 end
-circulant_attention(q::T, k::T, v::T, W::Int) where T = circulant_attention(DotSimilarity(), q, k, v, W)
+circulant_attention(q::AbstractArray, k::AbstractArray, v::AbstractArray, W::Int) = circulant_attention(DotSimilarity(), q, k, v, W)
 
 @doc raw"""
     y, A = circulant_mh_attention(simfun::AbstractSimilarity, q, k, v, W::Int, nheads::Int)
@@ -37,12 +39,12 @@ The returned adjacency matrix `A` will have `size(A, 3) == nheads`.
 
 See also [`circulant_attention`](@ref), [`DotSimilarity`](@ref), [`DistanceSimilarity`](@ref).
 """
-function circulant_mh_attention(simfun::AbstractSimilarity, q::T, k::T, v::T, W::Int, nheads::Int) where {Tv, N, T<: AbstractArray{Tv,N}}
+function circulant_mh_attention(simfun::AbstractSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, v::AbstractArray{Tv,N}, W::Int, nheads::Int) where {Tq, Tk, Tv, N}
     qr, kr, vr = splitheads.((q, k, v), nheads)
     yr, A = circulant_attention(simfun, qr, kr, vr, W)
     return reshape(yr, size(q)...), reshape(A, :, :, nheads, size(q, N))
 end
-circulant_mh_attention(q::T, k::T, v::T, W::Int, nheads::Int) where T = circulant_mh_attention(DotSimilarity(), q, k, v, W, nheads)
+circulant_mh_attention(q::AbstractArray, k::AbstractArray, v::AbstractArray, W::Int, nheads::Int) = circulant_mh_attention(DotSimilarity(), q, k, v, W, nheads)
 splitheads(x::AbstractArray{T,N}, nheads) where {T,N} = reshape(x, ntuple(i->size(x,i), N-2)..., size(x, N-1) ÷ nheads, :)
 
 function circulant_mh_adjacency(simfun, x::AbstractArray{T,N}, y, W::Integer, nheads::Int) where {T, N}

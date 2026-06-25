@@ -947,16 +947,17 @@ Window-renormalizing similarities (`TopKSimilarity`, `SparsemaxSimilarity`,
 
 See also [`circulant_attention`](@ref), [`circulant_mh_flash_attention`](@ref).
 """
-function circulant_flash_attention(simfun::AbstractSimilarity, q::T, k::T, v::T, W::Int) where {Tv, N, T<:AbstractArray{Tv,N}}
+function circulant_flash_attention(simfun::AbstractSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, v::AbstractArray{Tv,N}, W::Int) where {Tq, Tk, Tv, N}
+    # q, k, v may have distinct element types (e.g. complex q/k, real v).
     # scaling q,k by τ^(-1/2) ≡ scaling the similarity by 1/τ for every
     # supported simfun (dot- and distance-types are 2-homogeneous), so the
     # scale is folded into the kernels instead of allocating scaled copies
-    scale = inv(sqrt(real(Tv)(size(k, N-1))))
+    scale = inv(sqrt(real(Tk)(size(k, N-1))))
     _circulant_flash_attention(simfun, q, k, v, W, scale)
 end
-circulant_flash_attention(q::T, k::T, v::T, W::Int) where T = circulant_flash_attention(DotSimilarity(), q, k, v, W)
+circulant_flash_attention(q::AbstractArray, k::AbstractArray, v::AbstractArray, W::Int) = circulant_flash_attention(DotSimilarity(), q, k, v, W)
 
-function circulant_flash_attention(simfun::_UnfusableSimilarity, q::T, k::T, v::T, W::Int) where {Tv, N, T<:AbstractArray{Tv,N}}
+function circulant_flash_attention(simfun::_UnfusableSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, v::AbstractArray{Tv,N}, W::Int) where {Tq, Tk, Tv, N}
     throw(ArgumentError(
         "$(typeof(simfun)) renormalizes over the full window and cannot be fused; " *
         "use circulant_attention instead."))
@@ -971,12 +972,12 @@ result along channels. The number of channels must be divisible by `nheads`.
 
 See also [`circulant_mh_attention`](@ref).
 """
-function circulant_mh_flash_attention(simfun::AbstractSimilarity, q::T, k::T, v::T, W::Int, nheads::Int) where {Tv, N, T<:AbstractArray{Tv,N}}
+function circulant_mh_flash_attention(simfun::AbstractSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, v::AbstractArray{Tv,N}, W::Int, nheads::Int) where {Tq, Tk, Tv, N}
     qr, kr, vr = splitheads.((q, k, v), nheads)
     yr = circulant_flash_attention(simfun, qr, kr, vr, W)
     return reshape(yr, size(v)...)
 end
-circulant_mh_flash_attention(q::T, k::T, v::T, W::Int, nheads::Int) where T = circulant_mh_flash_attention(DotSimilarity(), q, k, v, W, nheads)
+circulant_mh_flash_attention(q::AbstractArray, k::AbstractArray, v::AbstractArray, W::Int, nheads::Int) = circulant_mh_flash_attention(DotSimilarity(), q, k, v, W, nheads)
 
 # rowwise logsumexp across the branch lse arrays; the max shift cancels
 # analytically in the gradient, so plain tracing is exact.
@@ -1031,7 +1032,7 @@ function circulant_flash_joint_attention(
     end
 end
 
-function circulant_flash_joint_attention(simfun::AbstractSimilarity, q::T, k::T, v::T, Ws::NTuple{M,Int}) where {T, M}
+function circulant_flash_joint_attention(simfun::AbstractSimilarity, q::AbstractArray, k::AbstractArray, v::AbstractArray, Ws::NTuple{M,Int}) where {M}
     circulant_flash_joint_attention(
         ntuple(_ -> simfun, Val(M)), ntuple(_ -> q, Val(M)),
         ntuple(_ -> k, Val(M)), ntuple(_ -> v, Val(M)), Ws)
@@ -1094,19 +1095,19 @@ See also [`circulant_mh_flash_joint_attention`](@ref).
 """
 function circulant_mh_flash_guided_joint_attention(
         simfun::AbstractSimilarity,
-        qz::AbstractArray{T,N}, kz::AbstractArray{T,N}, vz::AbstractArray{Tv,N}, Wz::Int,
-        kg::AbstractArray{T,N}, vg::AbstractArray{Tv,N}, Wg::Int,
-        num_guides::Int, nheads::Int) where {T, Tv, N}
+        qz::AbstractArray{Tq,N}, kz::AbstractArray{Tk,N}, vz::AbstractArray{Tv,N}, Wz::Int,
+        kg::AbstractArray{Tk,N}, vg::AbstractArray{Tv,N}, Wg::Int,
+        num_guides::Int, nheads::Int) where {Tq, Tk, Tv, N}
     # self branch (head-folded): yz (sp...,Cvh,nh·B), Lz_flat (nrows, nh·B)
     qzr, kzr, vzr = splitheads.((qz, kz, vz), nheads)
-    sz = inv(sqrt(real(T)(size(kzr, N-1))))
+    sz = inv(sqrt(real(Tk)(size(kzr, N-1))))
     yz, Lz_flat = _circulant_flash_attention_lse(simfun, qzr, kzr, vzr, Wz, sz)
 
     # guide branch: replicate the shared query across guides and attend them all
     # in one batched flash; yg (sp...,Cvh,nh·G·B), Lg_flat (nrows, nh·G·B)
     qg = _replicate_batch(qz, num_guides)
     qgr, kgr, vgr = splitheads.((qg, kg, vg), nheads)
-    sg = inv(sqrt(real(T)(size(kgr, N-1))))
+    sg = inv(sqrt(real(Tk)(size(kgr, N-1))))
     yg, Lg_flat = _circulant_flash_attention_lse(simfun, qgr, kgr, vgr, Wg, sg)
 
     nrows = size(Lz_flat, 1)
@@ -1269,13 +1270,14 @@ must be real-valued (window-renormalizing similarities are not supported).
 See also [`circulant_flash_attention`](@ref),
 [`circulant_mh_flash_transposed_attention`](@ref).
 """
-function circulant_flash_transposed_attention(simfun::AbstractSimilarity, q::T, k::T, x::T, W::Int) where {Tv, N, T<:AbstractArray{Tv,N}}
-    scale = inv(sqrt(real(Tv)(size(k, N-1))))
+function circulant_flash_transposed_attention(simfun::AbstractSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, x::AbstractArray{Tx,N}, W::Int) where {Tq, Tk, Tx, N}
+    # q, k (query/key) and x (the transpose-applied value) may differ in eltype.
+    scale = inv(sqrt(real(Tk)(size(k, N-1))))
     _circulant_flash_transposed_attention(simfun, q, k, x, W, scale)
 end
-circulant_flash_transposed_attention(q::T, k::T, x::T, W::Int) where T = circulant_flash_transposed_attention(DotSimilarity(), q, k, x, W)
+circulant_flash_transposed_attention(q::AbstractArray, k::AbstractArray, x::AbstractArray, W::Int) = circulant_flash_transposed_attention(DotSimilarity(), q, k, x, W)
 
-function circulant_flash_transposed_attention(simfun::_UnfusableSimilarity, q::T, k::T, x::T, W::Int) where {Tv, N, T<:AbstractArray{Tv,N}}
+function circulant_flash_transposed_attention(simfun::_UnfusableSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, x::AbstractArray{Tx,N}, W::Int) where {Tq, Tk, Tx, N}
     throw(ArgumentError(
         "$(typeof(simfun)) renormalizes over the full window and cannot be fused; " *
         "form the adjacency with circulant_adjacency and use circulant_mh_transposed_attention instead."))
@@ -1289,9 +1291,9 @@ the fused transposed attention on `nheads` channel groups separately and
 concatenates along channels. The number of channels must be divisible by
 `nheads`.
 """
-function circulant_mh_flash_transposed_attention(simfun::AbstractSimilarity, q::T, k::T, x::T, W::Int, nheads::Int) where {Tv, N, T<:AbstractArray{Tv,N}}
+function circulant_mh_flash_transposed_attention(simfun::AbstractSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, x::AbstractArray{Tx,N}, W::Int, nheads::Int) where {Tq, Tk, Tx, N}
     qr, kr, xr = splitheads.((q, k, x), nheads)
     yr = circulant_flash_transposed_attention(simfun, qr, kr, xr, W)
     return reshape(yr, size(x)...)
 end
-circulant_mh_flash_transposed_attention(q::T, k::T, x::T, W::Int, nheads::Int) where T = circulant_mh_flash_transposed_attention(DotSimilarity(), q, k, x, W, nheads)
+circulant_mh_flash_transposed_attention(q::AbstractArray, k::AbstractArray, x::AbstractArray, W::Int, nheads::Int) = circulant_mh_flash_transposed_attention(DotSimilarity(), q, k, x, W, nheads)

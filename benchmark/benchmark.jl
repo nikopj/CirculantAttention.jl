@@ -199,12 +199,17 @@ for elty in ELTYPES, tensorsize in TENSORSIZES, windowsize in WINDOWSIZES
     vg = CUDA.randn(elty, tensorsize[1:end-1]..., G*B)
     g_flops     = (G + 1) * (B * N * (2*C - 1) * windowsize^2 + B * N * C * (2*windowsize^2 - 1))
     g_gradflops = 3 * g_flops
-    rec("guided_pipeline",      g_flops, () -> guided_pipeline(DistanceSimilarity(), x, y, z, kg, vg, windowsize, windowsize, G, B, nhg))
+    # The standard (Γ-materializing) guided pipeline blows up with window² × G;
+    # only run it at smaller windows. The flash variants never form Γ, so they
+    # cover the full window sweep.
+    if windowsize < 25
+        rec("guided_pipeline", g_flops, () -> guided_pipeline(DistanceSimilarity(), x, y, z, kg, vg, windowsize, windowsize, G, B, nhg))
+        rec("guided_pipeline_gradient", g_gradflops, () -> Zygote.gradient((qz, kz, vz, kgg, vgg) -> begin
+            ya, yb = guided_pipeline(DistanceSimilarity(), qz, kz, vz, kgg, vgg, windowsize, windowsize, G, B, nhg); sum(abs2, ya) + sum(abs2, yb)
+        end, x, y, z, kg, vg))
+    end
     rec("guided_flash_tuple",   g_flops, () -> guided_flash_tuple(DistanceSimilarity(), x, y, z, kg, vg, windowsize, windowsize, G, B, nhg))
     rec("guided_flash_batched", g_flops, () -> circulant_mh_flash_guided_joint_attention(DistanceSimilarity(), x, y, z, windowsize, kg, vg, windowsize, G, nhg))
-    rec("guided_pipeline_gradient", g_gradflops, () -> Zygote.gradient((qz, kz, vz, kgg, vgg) -> begin
-        ya, yb = guided_pipeline(DistanceSimilarity(), qz, kz, vz, kgg, vgg, windowsize, windowsize, G, B, nhg); sum(abs2, ya) + sum(abs2, yb)
-    end, x, y, z, kg, vg))
     rec("guided_flash_batched_gradient", g_gradflops, () -> Zygote.gradient((qz, kz, vz, kgg, vgg) -> begin
         ya, yb = circulant_mh_flash_guided_joint_attention(DistanceSimilarity(), qz, kz, vz, windowsize, kgg, vgg, windowsize, G, nhg); sum(abs2, ya) + sum(abs2, yb)
     end, x, y, z, kg, vg))

@@ -243,6 +243,33 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
     end
 end
 
+# q/k may be complex while v is real (e.g. an energy map abs2.(·)); the
+# attention methods must accept distinct q/k/v element types and agree with the
+# composed path.
+@testset "mixed eltypes (complex q,k; real v)" begin
+    N, d, B, ws = 8, 4, 2, 5
+    for nsd in TEST_SPATDIMS
+        sp = ntuple(_ -> N, nsd)
+        q = CUDA.randn(ComplexF32, sp..., d, B)
+        k = CUDA.randn(ComplexF32, sp..., d, B)
+        v = CUDA.randn(Float32,    sp..., d, B)
+        for simfun in (RealDotSimilarity(), DistanceSimilarity(), PIDotSimilarity(), PIDistanceSimilarity())
+            yr, _ = circulant_attention(simfun, q, k, v, ws)
+            yf    = circulant_flash_attention(simfun, q, k, v, ws)
+            @test eltype(yf) == eltype(yr)
+            @test Array(yf) ≈ Array(yr)  rtol=1e-4 atol=1e-6
+
+            ymr, _ = circulant_mh_attention(simfun, q, k, v, ws, 2)
+            ymf    = circulant_mh_flash_attention(simfun, q, k, v, ws, 2)
+            @test Array(ymf) ≈ Array(reshape(ymr, size(v)...))  rtol=1e-4 atol=1e-6
+
+            # transposed: complex q,k applied to a real value
+            xt = circulant_flash_transposed_attention(simfun, q, k, v, ws)
+            @test eltype(xt) == eltype(v)
+        end
+    end
+end
+
 # unsupported configurations raise informative errors
 @testset "flash error paths" begin
     q = CUDA.randn(Float32, 8, 8, 4, 2)

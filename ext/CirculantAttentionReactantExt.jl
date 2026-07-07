@@ -16,15 +16,14 @@ module CirculantAttentionReactantExt
 # multi-head flash paths Reactant+Enzyme differentiable.
 
 using CirculantAttention
-const CA = CirculantAttention
 using Reactant
 
 # During tracing, replace the CUDA-kernel flash core with the array-op version.
 # `scale` is left untyped: `circulant_flash_attention` derives it from the (traced)
 # element type, so under Reactant it arrives as a TracedRNumber, not a `Real`.
-Reactant.@reactant_overlay @noinline function CA._circulant_flash_attention(
-        simfun::CA.AbstractSimilarity, q, k, v, W::Int, scale)
-    return CA._circ_flash_attention_shift(simfun, q, k, v, W, scale)
+Reactant.@reactant_overlay @noinline function CircAtt._circulant_flash_attention(
+        simfun::CircAtt.AbstractSimilarity, q, k, v, W::Int, scale)
+    return CircAtt._circ_flash_attention_shift(simfun, q, k, v, W, scale)
 end
 
 end # module

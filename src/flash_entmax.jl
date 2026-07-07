@@ -744,9 +744,28 @@ function _circulant_flash_entmax(simfun::AbstractSimilarity, α::Real, q, k, v, 
     first(_circulant_flash_entmax_fwd(simfun, α, q, k, v, W, scale))
 end
 
+# entmax δ_r = (Σ_i u_i g_i)/(Σ_i u_i) = Re⟨Δ_r, ỹ_r⟩ — dense host reduction over
+# the saved u-weighted output (the entmax analog of softmax's δ = Re⟨Δ, y⟩). For
+# joint normalization this is summed across branches (see ∇circulant_flash_joint_entmax).
+_entmax_delta(Δ::AbstractArray{TΔ,N}, ytil) where {TΔ,N} =
+    reshape(sum(real.(Δ .* conj.(ytil)); dims=N-1), :, size(Δ, N))
+
 function ∇circulant_flash_entmax(
         simfun::AbstractSimilarity, α::Real,
         Δ::AnyCuArray{TΔ,N}, y, tau, ytil,
+        q::AnyCuArray{Tq,N}, k::AnyCuArray{Tk,N}, v::AnyCuArray{Tv,N},
+        W::Int, scale::Real=true;
+        mode::Symbol=:auto,
+    ) where {TΔ, Tq, Tk, Tv, N}
+    _∇entmax_launch(simfun, α, Δ, tau, _entmax_delta(Δ, ytil), q, k, v, W, scale; mode)
+end
+
+# Backward kernel launch given the (possibly joint) threshold `tau` and normalizer
+# `δ` — both per-row arrays shared across branches in the joint case. This is the
+# single-branch entmax backward; the joint backward calls it once per branch.
+function _∇entmax_launch(
+        simfun::AbstractSimilarity, α::Real,
+        Δ::AnyCuArray{TΔ,N}, tau, δ,
         q::AnyCuArray{Tq,N}, k::AnyCuArray{Tk,N}, v::AnyCuArray{Tv,N},
         W::Int, scale::Real=true;
         mode::Symbol=:auto,
@@ -755,10 +774,6 @@ function ∇circulant_flash_entmax(
     dq = similar(q, Tqk)
     dk = similar(k, Tqk)
     dv = similar(v, TΔ)
-
-    # δ_r = (Σ_i u_i g_i)/(Σ_i u_i) = Re⟨Δ_r, ỹ_r⟩ — dense host reduction over the
-    # saved u-weighted output (the entmax analog of softmax's δ = Re⟨Δ, y⟩).
-    δ = reshape(sum(real.(Δ .* conj.(ytil)); dims=N-1), :, size(Δ, N))
 
     spatdims, nrows, K, maxidx = _flash_launch_dims(q, W)
     C  = Int32(size(q, N-1))

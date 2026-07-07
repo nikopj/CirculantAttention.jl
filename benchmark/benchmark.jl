@@ -71,6 +71,15 @@ function entmax_pipeline(simfun, α, q, k, v, W)
     return A ⊗ v
 end
 
+# composed JOINT α-entmax over two windows (reference for the fused flash joint).
+function joint_entmax_pipeline(simfun, α, q, k, v, W1, W2)
+    τ = sqrt(real(eltype(k))(size(k, ndims(k) - 1)))
+    S1 = circulant_similarity(simfun, q ./ sqrt(τ), k ./ sqrt(τ), W1)
+    S2 = circulant_similarity(simfun, q ./ sqrt(τ), k ./ sqrt(τ), W2)
+    A1, A2 = joint_entmax(Float32(α), S1, S2)
+    return A1 ⊗ v, A2 ⊗ v
+end
+
 # guide tensors stacked guide-fastest as (lead..., G·B); slice guide g → (lead..., B)
 _gslice(x5, g) = x5[ntuple(_ -> Colon(), ndims(x5) - 2)..., g, :]
 
@@ -206,6 +215,17 @@ for elty in ELTYPES, tensorsize in TENSORSIZES, windowsize in WINDOWSIZES
     end, x, y, z))
     rec("circulant_flash_joint_attention_gradient", joint_gradflops, () -> Zygote.gradient((q, k, v) -> begin
         ya, yb = circulant_flash_joint_attention(DistanceSimilarity(), q, k, v, Wsj); sum(abs2, ya) + sum(abs2, yb)
+    end, x, y, z))
+
+    # joint α-entmax (α=1.5) over the same windows: composed vs fused flash
+    esj = EntmaxSimilarity(DistanceSimilarity(), 1.5f0)
+    rec("circulant_joint_entmax_pipeline", joint_flops, () -> joint_entmax_pipeline(DistanceSimilarity(), 1.5f0, x, y, z, Wsj...))
+    rec("circulant_flash_joint_entmax",    joint_flops, () -> circulant_flash_joint_attention(esj, x, y, z, Wsj))
+    rec("circulant_joint_entmax_pipeline_gradient", joint_gradflops, () -> Zygote.gradient((q, k, v) -> begin
+        ya, yb = joint_entmax_pipeline(DistanceSimilarity(), 1.5f0, q, k, v, Wsj...); sum(abs2, ya) + sum(abs2, yb)
+    end, x, y, z))
+    rec("circulant_flash_joint_entmax_gradient", joint_gradflops, () -> Zygote.gradient((q, k, v) -> begin
+        ya, yb = circulant_flash_joint_attention(esj, q, k, v, Wsj); sum(abs2, ya) + sum(abs2, yb)
     end, x, y, z))
 
     # guided multi-guide joint attention (nheads=4, G guides, all windows =

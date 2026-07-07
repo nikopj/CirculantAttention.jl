@@ -194,3 +194,18 @@ comparison_plot(df,
     ["softmax" "entmax (α=1.5)" "sparsemax"],
     "flash forward: softmax vs entmax vs sparsemax",
     "flash_normalization_comparison")
+
+# ------------------------------------------------------------------
+# joint α-entmax: composed vs fused flash, forward and forward+backward
+# ------------------------------------------------------------------
+comparison_plot(df,
+    ["circulant_joint_entmax_pipeline", "circulant_flash_joint_entmax"],
+    ["standard" "flash"],
+    "joint entmax (α=1.5) forward: standard vs flash",
+    "flash_joint_entmax_comparison")
+
+comparison_plot(df,
+    ["circulant_joint_entmax_pipeline_gradient", "circulant_flash_joint_entmax_gradient"],
+    ["standard" "flash"],
+    "joint entmax (α=1.5) forward+backward: standard vs flash",
+    "flash_joint_entmax_gradient_comparison")

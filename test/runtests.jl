@@ -32,5 +32,6 @@ include("utils.jl")
     # include("correctness.jl")
     include("flash.jl")
     include("correctness.jl")
+    include("reactant.jl")   # box-only; self-skips if Reactant/Enzyme unavailable
     # include("grad.jl")
 # end

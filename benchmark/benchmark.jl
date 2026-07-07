@@ -9,6 +9,18 @@ using Dates
 
 CUDA.allowscalar(false)
 
+# Reactant + Enzyme are optional: the benchmark records a "reactant" backward
+# timing next to each "zygote" one when they are available, and runs exactly as
+# before otherwise. Loading Reactant also loads the CirculantAttention extension
+# that provides the `reactant_*_grad` entry points.
+const HAS_REACTANT = try
+    @eval using Reactant, Enzyme
+    true
+catch err
+    @warn "Reactant/Enzyme unavailable — running Zygote-only benchmarks" exception=err
+    false
+end
+
 # --------------------------
 # utils
 # --------------------------
@@ -39,6 +51,27 @@ function bench_gpu(f; samples=50, warmup=3)
 
     time_ms = median(trial).time / 1e6
     return time_ms
+end
+
+# Time a Reactant-compiled gradient. `thunk` is a zero-arg closure that invokes
+# an already-`@compile`d callable on its ConcreteRArray inputs — compilation must
+# happen at the call site BEFORE this, so only execution is timed. We sync on the
+# Reactant device so async XLA execution is fully measured.
+#
+# NB (box tuning): the exact sync entry point has moved across Reactant releases
+# — if `Reactant.synchronize()` is not defined on your version, replace the two
+# `_reactant_sync()` calls with the current API (e.g. `Reactant.XLA.synchronize`
+# or materializing an output element).
+_reactant_sync() = Reactant.synchronize()
+
+function bench_reactant(thunk; samples=50, warmup=3)
+    for _ in 1:warmup
+        thunk(); _reactant_sync()
+    end
+    trial = @benchmark begin
+        $thunk(); _reactant_sync()
+    end samples=samples evals=1 gcsample=true
+    return median(trial).time / 1e6
 end
 
 # --------------------------
@@ -108,6 +141,7 @@ results = DataFrame(
     tensorsize = Tuple[],
     windowsize = Int[],
     function_name = String[],
+    backend = String[],          # "zygote" | "reactant"
     time_ms = Float64[],
     gflops = Float64[],
 )
@@ -139,13 +173,25 @@ for elty in ELTYPES, tensorsize in TENSORSIZES, windowsize in WINDOWSIZES
     # bench `f`, record under `name` with the given nominal flops, and print a
     # progress line (so a long run shows steady output). Closure captures the
     # loop vars + globals so call sites stay short.
-    rec = function (name, flops, f)
-        print("    ", rpad(name, 38), " … "); flush(stdout)
-        t  = bench_gpu(f)
+    rec = function (name, flops, f; backend="zygote")
+        label = backend == "zygote" ? name : "$name [$backend]"
+        print("    ", rpad(label, 46), " … "); flush(stdout)
+        t  = backend == "reactant" ? bench_reactant(f) : bench_gpu(f)
         gf = flops / (t / 1e3) / 1e9
-        push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, name, t, gf))
+        push!(results, (commit, date, dev_name, string(elty), tensorsize, windowsize, name, backend, t, gf))
         println(lpad(round(t; digits=3), 9), " ms   ", lpad(round(gf; digits=1), 8), " GFLOP/s")
         return t
+    end
+
+    # Reactant grad rows run only when Reactant is available and inputs are real
+    # (Tier 1 — the KA/Enzyme path does not yet cover complex inputs). Inputs are
+    # converted to ConcreteRArrays once; each op is `@compile`d at its call site
+    # (outside timing) with the hyperparameters captured as constants.
+    reactant_on = HAS_REACTANT && (elty <: Real)
+    local xr, yr, zr, sc
+    if reactant_on
+        xr, yr, zr = Reactant.to_rarray.((x, y, z))
+        sc = inv(sqrt(real(elty)(C)))
     end
 
     sim_flops  = B * N * (2*C - 1) * (windowsize^2)
@@ -165,6 +211,13 @@ for elty in ELTYPES, tensorsize in TENSORSIZES, windowsize in WINDOWSIZES
     # forward + backward: composed vs fused gradients
     rec("circulant_attention_gradient", grad_flops, () -> Zygote.gradient((q, k, v) -> sum(abs2, first(circulant_attention(DistanceSimilarity(), q, k, v, windowsize))), x, y, z))
     rec("circulant_flash_attention_gradient", grad_flops, () -> Zygote.gradient((q, k, v) -> sum(abs2, circulant_flash_attention(DistanceSimilarity(), q, k, v, windowsize)), x, y, z))
+    if reactant_on
+        # capture simfun/W/scale as constants; only q,k,v are traced arrays
+        flashgrad = (q, k, v) -> CircAtt.reactant_flash_grad(DistanceSimilarity(), q, k, v, windowsize, sc)
+        gflash = @compile flashgrad(xr, yr, zr)
+        rec("circulant_flash_attention_gradient", grad_flops,
+            () -> gflash(xr, yr, zr); backend="reactant")
+    end
 
     # multi-head (nheads=4 → 16 channels per head): the per-head channel count
     # drops, so the adjacency-matrix traffic the flash kernels avoid is a much
@@ -227,5 +280,11 @@ for elty in ELTYPES, tensorsize in TENSORSIZES, windowsize in WINDOWSIZES
 end
 
 println("\nfinished $NITER configs in $(round(Int, time() - t_start))s")
-CSV.write("benchmark/benchmark_results.csv", results; append=true)
-println("Saved benchmark_results.csv")
+
+# New schema carries a `backend` column ("zygote"/"reactant"), so results go to a
+# separate, header-carrying file rather than the header-less positional
+# benchmark_results.csv (whose historical rows have no backend column). Append
+# without a header on subsequent runs; write the header when creating the file.
+const RESULTS_CSV = "benchmark/benchmark_results_backend.csv"
+CSV.write(RESULTS_CSV, results; append=isfile(RESULTS_CSV), writeheader=!isfile(RESULTS_CSV))
+println("Saved $RESULTS_CSV")

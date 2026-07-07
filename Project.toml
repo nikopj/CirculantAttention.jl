@@ -19,10 +19,9 @@ cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [weakdeps]
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
-Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 
 [extensions]
-CirculantAttentionReactantExt = ["Reactant", "Enzyme"]
+CirculantAttentionEnzymeExt = ["Enzyme"]
 
 [compat]
 Adapt = "4, 5"
@@ -33,7 +32,6 @@ Enzyme = "0.13"
 GPUArrays = "11"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1"
-Reactant = "0.2"
 MLUtils = "0.4"
 NNlib = "0.9"
 SparseArrays = "1"
@@ -46,8 +44,7 @@ ChainRulesTestUtils = "cdddcdb0-9152-4a09-a978-84456f9df70a"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 FiniteDifferences = "26cc04aa-876d-5657-8c51-4c34ba976000"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
-Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "ChainRulesTestUtils", "FiniteDifferences", "Random", "Reactant", "Enzyme"]
+test = ["Test", "ChainRulesTestUtils", "FiniteDifferences", "Random", "Enzyme"]

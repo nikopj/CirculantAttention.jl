@@ -1,6 +1,7 @@
 using CirculantAttention
 using Test
 using Zygote
+using Enzyme   # loads CirculantAttentionEnzymeExt (imports the flash rrules)
 
 using Adapt
 using LinearAlgebra
@@ -32,6 +33,5 @@ include("utils.jl")
     # include("correctness.jl")
     include("flash.jl")
     include("correctness.jl")
-    include("reactant.jl")   # box-only; self-skips if Reactant/Enzyme unavailable
-    # include("grad.jl")
+    include("grad.jl")   # includes the Enzyme flash-gradient tests
 # end

@@ -45,11 +45,6 @@ export circulant_flash_transposed_attention, circulant_mh_flash_transposed_atten
 
 include("batchedmul.jl")
 
-# KernelAbstractions forward kernels for the Reactant + Enzyme path (always
-# loaded — KA is a hard dep). The Reactant/Enzyme autodiff glue lives in
-# ext/CirculantAttentionReactantExt.jl and is loaded only when Reactant is.
-include("ka_forward.jl")
-
 include("rrules.jl")
 include("zygote.jl")
 

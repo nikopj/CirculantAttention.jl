@@ -82,27 +82,16 @@ end
     _joint_usum(usum, Base.tail(brs), τ, r, b, spatdims, αm1, pe, κ0, κs)
 end
 
-# Halley/bisection joint τ solve, parametrized by the reduction (identity for the
-# thread kernel; a warp/block reduce for the cooperative kernels). `red` maps a
-# scalar → the group-reduced scalar. Returns (τ, usum).
-@inline function _joint_solve(brs, r::Int32, b::Int32, spatdims, αm1::T, pe::T, κ0::Int32, κs::Int32, red::F) where {T, F}
-    zmax = red(_joint_zmax(typemin(T), brs, r, b, spatdims, αm1, κ0, κs), max)
-    t   = zmax - T(0.5); tlo = zmax - one(T); thi = zmax
-    for _ in 1:_FLASH_ENTMAX_NITER
-        a0, a1, a2 = _joint_acc((zero(T), zero(T), zero(T)), brs, t, r, b, spatdims, αm1, pe, κ0, κs)
-        a0 = red(a0, +); a1 = red(a1, +); a2 = red(a2, +)
-        t, tlo, thi = _halley_step(a0, a1, a2, t, tlo, thi, pe)
-    end
-    τ = t
-    usum = red(_joint_usum(zero(T), brs, τ, r, b, spatdims, αm1, pe, κ0, κs), +)
-    return τ, usum
-end
+# The joint Halley τ-solve is inlined into each of the three forward kernels
+# below (thread / warp / block) rather than abstracted behind a reduction
+# callable — passing a capturing closure (submask/scratch) plus the max/+ op as a
+# runtime value defeats GPU inlining and allocates. Only the per-branch PARTIAL
+# reducers (_joint_zmax/_joint_acc/_joint_usum) are shared; the group reduction
+# (identity / _warp_reduce / _block_reduce) is written out per variant.
 
 # ------------------------------------------------------------------
 # forward — thread-per-row (generic / CPU-testable reference)
 # ------------------------------------------------------------------
-@inline _reduce_identity(x, op) = x   # single thread already holds the full sum
-
 @inline _joint_apply_thread!(::Tuple{}, ::Tuple{}, ::Tuple{}, τ, uinv, r::Int32, b::Int32, spatdims, αm1, pe, ::Val{CH}) where CH = nothing
 @inline function _joint_apply_thread!(brs::Tuple, ys::Tuple, yts::Tuple, τ, uinv, r::Int32, b::Int32, spatdims, αm1, pe, ::Val{CH}) where CH
     br = first(brs); y_m = first(ys); yt_m = first(yts)
@@ -132,7 +121,14 @@ end
 end
 
 @inline function _flash_joint_entmax_row!(brs, ys, yts, tau, r::Int32, b::Int32, spatdims, αm1::T, pe::T, chunk::Val{CH}) where {T, CH}
-    τ, usum = _joint_solve(brs, r, b, spatdims, αm1, pe, 1i32, 1i32, _reduce_identity)
+    zmax = _joint_zmax(typemin(T), brs, r, b, spatdims, αm1, 1i32, 1i32)
+    t = zmax - T(0.5); tlo = zmax - one(T); thi = zmax
+    for _ in 1:_FLASH_ENTMAX_NITER
+        a0, a1, a2 = _joint_acc((zero(T), zero(T), zero(T)), brs, t, r, b, spatdims, αm1, pe, 1i32, 1i32)
+        t, tlo, thi = _halley_step(a0, a1, a2, t, tlo, thi, pe)
+    end
+    τ = t
+    usum = _joint_usum(zero(T), brs, τ, r, b, spatdims, αm1, pe, 1i32, 1i32)
     @inbounds tau[r, b] = τ
     _joint_apply_thread!(brs, ys, yts, τ, inv(usum), r, b, spatdims, αm1, pe, chunk)
     return nothing
@@ -185,8 +181,17 @@ end
 end
 
 @inline function _flash_joint_entmax_warp_group!(brs, ys, yts, tau, r::Int32, b::Int32, lane::Int32, submask::UInt32, spatdims, αm1::T, pe::T, ::Val{WS}) where {T, WS}
-    red = (x, op) -> _warp_reduce(op, x, submask, Val(WS))
-    τ, usum = _joint_solve(brs, r, b, spatdims, αm1, pe, lane, Int32(WS), red)
+    zmax = _warp_reduce(max, _joint_zmax(typemin(T), brs, r, b, spatdims, αm1, lane, Int32(WS)), submask, Val(WS))
+    t = zmax - T(0.5); tlo = zmax - one(T); thi = zmax
+    for _ in 1:_FLASH_ENTMAX_NITER
+        a0l, a1l, a2l = _joint_acc((zero(T), zero(T), zero(T)), brs, t, r, b, spatdims, αm1, pe, lane, Int32(WS))
+        a0 = _warp_reduce(+, a0l, submask, Val(WS))
+        a1 = _warp_reduce(+, a1l, submask, Val(WS))
+        a2 = _warp_reduce(+, a2l, submask, Val(WS))
+        t, tlo, thi = _halley_step(a0, a1, a2, t, tlo, thi, pe)
+    end
+    τ = t
+    usum = _warp_reduce(+, _joint_usum(zero(T), brs, τ, r, b, spatdims, αm1, pe, lane, Int32(WS)), submask, Val(WS))
     if lane == 1i32
         @inbounds tau[r, b] = τ
     end
@@ -249,12 +254,21 @@ function circulant_flash_joint_entmax_block_kernel!(brs, ys, yts, tau, nrows::In
     lane   = (tid - 1i32) % 32i32 + 1i32
     wid    = (tid - 1i32) ÷ 32i32 + 1i32
     nwarps = TB ÷ 32i32
-    red = (x, op) -> _block_reduce(op, x, op === max ? typemin(typeof(x)) : zero(typeof(x)), scratch)
     g = blockIdx().x
     while g <= ngroups
         r = (g - 1i32) % nrows + 1i32
         b = (g - 1i32) ÷ nrows + 1i32
-        τ, usum = _joint_solve(brs, r, b, spatdims, αm1, pe, tid, TB, red)
+        zmax = _block_reduce(max, _joint_zmax(typemin(T), brs, r, b, spatdims, αm1, tid, TB), typemin(T), scratch)
+        t = zmax - T(0.5); tlo = zmax - one(T); thi = zmax
+        for _ in 1:_FLASH_ENTMAX_NITER
+            a0l, a1l, a2l = _joint_acc((zero(T), zero(T), zero(T)), brs, t, r, b, spatdims, αm1, pe, tid, TB)
+            a0 = _block_reduce(+, a0l, zero(T), scratch)
+            a1 = _block_reduce(+, a1l, zero(T), scratch)
+            a2 = _block_reduce(+, a2l, zero(T), scratch)
+            t, tlo, thi = _halley_step(a0, a1, a2, t, tlo, thi, pe)
+        end
+        τ = t
+        usum = _block_reduce(+, _joint_usum(zero(T), brs, τ, r, b, spatdims, αm1, pe, tid, TB), zero(T), scratch)
         if tid == 1i32
             @inbounds tau[r, b] = τ
         end

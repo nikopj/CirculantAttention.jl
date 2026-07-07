@@ -423,7 +423,8 @@ the self output and the summed guide output — i.e. `circulant_mh_flash_joint_a
 over `(self, g₁…g_G)` with the guide outputs summed.
 """
 function circulant_mh_flash_guided_joint_attention(sf::Union{EntmaxSimilarity,SparsemaxSimilarity},
-        qz::AbstractArray{Tq,N}, kz, vz, Wz::Int, kg, vg, Wg::Int, num_guides::Int, nheads::Int) where {Tq, N}
+        qz::AbstractArray{Tq,N}, kz::AbstractArray{Tk,N}, vz::AbstractArray{Tv,N}, Wz::Int,
+        kg::AbstractArray{Tk,N}, vg::AbstractArray{Tv,N}, Wg::Int, num_guides::Int, nheads::Int) where {Tq, Tk, Tv, N}
     sp = size(qz)[1:N-2]; d = size(qz, N-1); B = size(qz, N)
     kgr = reshape(kg, sp..., d, num_guides, B)
     vgr = reshape(vg, sp..., d, num_guides, B)

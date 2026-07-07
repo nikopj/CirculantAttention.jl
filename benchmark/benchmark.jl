@@ -63,6 +63,14 @@ function joint_pipeline(simfun, q, k, v, W1, W2)
     return A1 ⊗ v, A2 ⊗ v
 end
 
+# composed α-entmax attention (reference for the fused flash entmax); mirrors the
+# flash 1/√C similarity scaling (q,k scaled by 1/√τ, τ=√C).
+function entmax_pipeline(simfun, α, q, k, v, W)
+    τ = sqrt(real(eltype(k))(size(k, ndims(k) - 1)))
+    A = circulant_adjacency(EntmaxSimilarity(simfun, Float32(α)), q ./ sqrt(τ), k ./ sqrt(τ), W)
+    return A ⊗ v
+end
+
 # guide tensors stacked guide-fastest as (lead..., G·B); slice guide g → (lead..., B)
 _gslice(x5, g) = x5[ntuple(_ -> Colon(), ndims(x5) - 2)..., g, :]
 
@@ -165,6 +173,17 @@ for elty in ELTYPES, tensorsize in TENSORSIZES, windowsize in WINDOWSIZES
     # forward + backward: composed vs fused gradients
     rec("circulant_attention_gradient", grad_flops, () -> Zygote.gradient((q, k, v) -> sum(abs2, first(circulant_attention(DistanceSimilarity(), q, k, v, windowsize))), x, y, z))
     rec("circulant_flash_attention_gradient", grad_flops, () -> Zygote.gradient((q, k, v) -> sum(abs2, circulant_flash_attention(DistanceSimilarity(), q, k, v, windowsize)), x, y, z))
+
+    # α-entmax (α=1.5) and sparsemax (α=2): composed adjacency⊗v pipeline vs the
+    # fused AdaSplash-style flash kernel, forward and forward+backward.
+    es15 = EntmaxSimilarity(DistanceSimilarity(), 1.5f0)
+    ssmx = SparsemaxSimilarity(DistanceSimilarity())
+    rec("circulant_entmax_pipeline",         e2e_flops, () -> entmax_pipeline(DistanceSimilarity(), 1.5f0, x, y, z, windowsize))
+    rec("circulant_flash_entmax",            e2e_flops, () -> circulant_flash_attention(es15, x, y, z, windowsize))
+    rec("circulant_flash_entmax_thread",     e2e_flops, () -> CircAtt._circulant_flash_entmax_fwd(DistanceSimilarity(), 1.5f0, x, y, z, windowsize; mode=:thread))
+    rec("circulant_flash_sparsemax",         e2e_flops, () -> circulant_flash_attention(ssmx, x, y, z, windowsize))
+    rec("circulant_entmax_pipeline_gradient", grad_flops, () -> Zygote.gradient((q, k, v) -> sum(abs2, entmax_pipeline(DistanceSimilarity(), 1.5f0, q, k, v, windowsize)), x, y, z))
+    rec("circulant_flash_entmax_gradient",    grad_flops, () -> Zygote.gradient((q, k, v) -> sum(abs2, circulant_flash_attention(es15, q, k, v, windowsize)), x, y, z))
 
     # multi-head (nheads=4 → 16 channels per head): the per-head channel count
     # drops, so the adjacency-matrix traffic the flash kernels avoid is a much

@@ -942,8 +942,9 @@ intermediate exists in either direction.
 
 The similarity must be real-valued (`RealDotSimilarity`, `DistanceSimilarity`,
 `PIDotSimilarity`, `PIDistanceSimilarity`, or `DotSimilarity` on real inputs).
-Window-renormalizing similarities (`TopKSimilarity`, `SparsemaxSimilarity`,
-`EntmaxSimilarity`) are not supported.
+`SparsemaxSimilarity` and `EntmaxSimilarity` are supported via dedicated fused
+α-entmax methods (see the `EntmaxSimilarity`/`SparsemaxSimilarity` methods of this
+function); `TopKSimilarity` renormalizes over the full window and is not fusable.
 
 See also [`circulant_attention`](@ref), [`circulant_mh_flash_attention`](@ref).
 """

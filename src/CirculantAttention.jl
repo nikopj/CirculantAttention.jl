@@ -43,6 +43,10 @@ export circulant_flash_attention, circulant_mh_flash_attention, circulant_flash_
 export circulant_mh_flash_joint_attention, circulant_mh_flash_guided_joint_attention
 export circulant_flash_transposed_attention, circulant_mh_flash_transposed_attention
 
+# fused (flash) α-entmax / sparsemax attention — extends circulant_flash_attention
+# and circulant_mh_flash_attention for EntmaxSimilarity / SparsemaxSimilarity.
+include("flash_entmax.jl")
+
 include("batchedmul.jl")
 
 include("rrules.jl")

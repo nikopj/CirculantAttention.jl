@@ -170,3 +170,27 @@ comparison_plot(df,
     ["standard" "flash (batched)"],
     "guided multi-guide forward+backward: standard vs flash",
     "flash_guided_gradient_comparison")
+
+# ------------------------------------------------------------------
+# α-entmax: composed (adjacency ⊗ v) vs fused flash, forward & fwd+bwd
+# ------------------------------------------------------------------
+comparison_plot(df,
+    ["circulant_entmax_pipeline", "circulant_flash_entmax", "circulant_flash_entmax_thread"],
+    ["standard" "flash" "flash (thread)"],
+    "entmax (α=1.5) forward: standard vs flash",
+    "flash_entmax_comparison")
+
+comparison_plot(df,
+    ["circulant_entmax_pipeline_gradient", "circulant_flash_entmax_gradient"],
+    ["standard" "flash"],
+    "entmax (α=1.5) forward+backward: standard vs flash",
+    "flash_entmax_gradient_comparison")
+
+# ------------------------------------------------------------------
+# fused normalizations head-to-head: softmax vs α-entmax vs sparsemax (forward)
+# ------------------------------------------------------------------
+comparison_plot(df,
+    ["circulant_flash_attention", "circulant_flash_entmax", "circulant_flash_sparsemax"],
+    ["softmax" "entmax (α=1.5)" "sparsemax"],
+    "flash forward: softmax vs entmax vs sparsemax",
+    "flash_normalization_comparison")

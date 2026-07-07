@@ -7,17 +7,24 @@
 stretch_support!(W) = (W .+= 2 .* (W .- sum(W; dims=1) ./ size(W, 1)); W)
 
 # The opposite conditioning, for the entmax α-gradient. Center each column and
-# rescale to a small fixed spread (±0.5) so entmax(α∈(1,2]) is DENSE — every
-# entry strictly in-support with clear margin from zero. Stretching (above)
-# drives entmax toward one-hot, where ∂p/∂α ≈ 0 (degenerate) AND the marginal
-# entry sits on the support boundary, so FiniteDifferences' α-step kinks across
-# it and its reference gradient is wrong. In the dense regime both the W- and
-# α-gradients are smooth and FD is reliable, at tight tolerance.
+# rescale so entmax(α∈(1,2]) is DENSE — every entry strictly in-support with
+# clear margin from zero. Stretching (above) drives entmax toward one-hot,
+# where ∂p/∂α ≈ 0 (degenerate) AND the marginal entry sits on the support
+# boundary, so FiniteDifferences' α-step kinks across it and its reference
+# gradient is wrong. In the dense regime both the W- and α-gradients are smooth
+# and FD is reliable, at tight tolerance.
+#
+# Density is dimension-dependent: sparsemax (the sparsest case, α=2) is dense
+# iff (n-1)·(max-min) ≤ 1, where n = size(W,1) is the window length (= 3 in 1D,
+# 9 in 2D for ws=3). A fixed spread that is dense in 1D goes sparse in 2D, so we
+# scale the peak-to-peak spread to 0.2/(n-1) — a 5× margin under the bound,
+# dense for every window size and every α∈(1,2].
 function densify!(W)
-    m   = sum(W; dims=1) ./ size(W, 1)
+    n   = size(W, 1)
+    m   = sum(W; dims=1) ./ n
     W .-= m
-    pk  = maximum(abs.(W); dims=1) .+ 1f-6
-    W  .= 0.5f0 .* W ./ pk
+    pk  = maximum(abs.(W); dims=1) .+ 1f-6      # current half-spread
+    W  .= (0.1f0 / max(n - 1, 1)) .* W ./ pk     # peak-to-peak = 0.2/(n-1)
     return W
 end
 
@@ -73,15 +80,17 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
     @testset "Scalar multiplication [$tag]" begin
         c  = real(elty)(2.5)
         # The scalar's cotangent is ⟨A, Δout⟩ — a reduction over all nnz entries.
-        # A random output tangent makes this a small, near-cancelled sum that
-        # Float32 finite-differencing can't resolve (low-order bits are the whole
-        # answer). Seed the output tangent from A itself so ⟨A, Δout⟩ = ‖A‖²:
-        # O(nnz), strictly positive, cancellation-free — the FD reference is then
-        # reliable without loosening tolerances. (The array cotangent is c·Δout,
-        # well-conditioned per element either way.)
+        # A random Δout makes it a small, near-cancelled sum Float32 FD can't
+        # resolve. Align Δout with A so ⟨A, Δout⟩ is cancellation-free, and
+        # normalise by ‖A‖² so it equals exactly 1 AND the projected loss stays
+        # O(1): a copy(A) seed instead inflates the loss to c‖A‖² (~1e4 in 2D),
+        # which raises the Float32 FD noise floor and trips the near-zero array
+        # cotangent elements. atol=1e-4 covers the (now small) array cotangent's
+        # near-zero entries; rtol=1e-3 guards the scalar cotangent (= 1).
         Δout = copy(A)
+        Δout.data.nzVal ./= sum(abs2, A.data.nzVal)
         test_rrule(*, c, A ⊢ ΔA;
-            output_tangent=Δout, rtol=1e-3, atol=1e-5, check_inferred=false)
+            output_tangent=Δout, rtol=1e-3, atol=1e-4, check_inferred=false)
     end
 
     # --------------------------------------------------------
@@ -173,9 +182,14 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         reps  = ntuple(i -> i == ndims(A) ? 2 : 1, ndims(A))
         Arep  = repeat(A, reps...)
         ΔArep = rand_tangent(Arep)
+        # ∂A_k = Σ_reps ΔArep_k sums the tangents of the repeated copies; summing
+        # random tangents yields some near-zero cotangent elements (cancellation)
+        # that sit below the Float32 FD noise floor. atol=1e-4 covers them;
+        # rtol=1e-3 guards the O(1) elements. (cat, a non-summing slice, has no
+        # such cancellation and passes at 1e-5.)
         test_rrule(
             Base.repeat, A ⊢ ΔA, reps...;
-            output_tangent=ΔArep, rtol=1e-3, atol=1e-5, check_inferred=false,
+            output_tangent=ΔArep, rtol=1e-3, atol=1e-4, check_inferred=false,
         )
     end
 

@@ -1,3 +1,11 @@
+# Stretch nzVals away from their per-row mean along the normalisation dim
+# (dims=1) so in-/out-of-support entries have a clear margin. sparsemax/entmax
+# are piecewise-linear with breakpoints at the support boundary; without a
+# margin, FiniteDifferences' finite perturbation flips support membership and
+# its reference gradient is wrong at those entries. Matches the conditioning
+# used in the joint_sparsemax/joint_entmax tests.
+stretch_support!(W) = (W .+= 2 .* (W .- sum(W; dims=1) ./ size(W, 1)); W)
+
 @testset "Low-level Circulant rrules" begin
 
 for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
@@ -49,8 +57,16 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
 
     @testset "Scalar multiplication [$tag]" begin
         c  = real(elty)(2.5)
+        # The scalar's cotangent is ⟨A, Δout⟩ — a reduction over all nnz entries.
+        # A random output tangent makes this a small, near-cancelled sum that
+        # Float32 finite-differencing can't resolve (low-order bits are the whole
+        # answer). Seed the output tangent from A itself so ⟨A, Δout⟩ = ‖A‖²:
+        # O(nnz), strictly positive, cancellation-free — the FD reference is then
+        # reliable without loosening tolerances. (The array cotangent is c·Δout,
+        # well-conditioned per element either way.)
+        Δout = copy(A)
         test_rrule(*, c, A ⊢ ΔA;
-            output_tangent=ΔB, rtol=1e-3, atol=1e-5, check_inferred=false)
+            output_tangent=Δout, rtol=1e-3, atol=1e-5, check_inferred=false)
     end
 
     # --------------------------------------------------------
@@ -175,7 +191,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
     # 16. sparsemax, entmax
     # --------------------------------------------------------
     @testset "sparsemax [$tag]" begin
-        W = windowview(real(A))
+        W = windowview(real(A)); stretch_support!(W)
         ΔW = similar(W); randn!(ΔW)
         V = similar(W); randn!(V)
         test_rrule(sparsemax, W ⊢ ΔW, output_tangent=V,
@@ -184,7 +200,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
     end
 
     @testset "entmax, α scalar [$tag]" begin
-        W = windowview(real(A))
+        W = windowview(real(A)); stretch_support!(W)
         ΔW = similar(W); randn!(ΔW)
         V = similar(W); randn!(V)
         test_rrule(entmax, W ⊢ ΔW, 1.5f0 ⊢ (1f0 + rand()), output_tangent=V,
@@ -194,7 +210,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
 
     @testset "entmax, α array [$tag]" begin
         α  = 1f0 .+ CUDA.rand(Float32, 1, 1, 2, 1)
-        W  = windowview(real(A .* α))
+        W  = windowview(real(A .* α)); stretch_support!(W)
         ΔW = similar(W); randn!(ΔW)
         V  = similar(W); randn!(V)
         Δα = CUDA.rand(Float32, 1, 1, 2, 1)

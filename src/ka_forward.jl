@@ -135,7 +135,11 @@ function _ka_flash_attention_fwd(
         q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, v::AbstractArray{Tv,N},
         W::Int, scale::Real=true) where {Tq, Tk, Tv, N}
     Ts = simval_dtype(simfun, Tq, Tk)
-    Ts <: Real || throw(ArgumentError(
+    # Reject genuinely complex-valued similarities (e.g. DotSimilarity on complex
+    # inputs) — softmax needs a real argument. Test NOT-complex rather than
+    # `<: Real` so Reactant's `TracedRNumber{Float32}` (not a `Real` subtype) is
+    # accepted during tracing.
+    Ts <: Complex && throw(ArgumentError(
         "_ka_flash_attention needs a real-valued similarity; $(typeof(simfun)) on " *
         "($Tq, $Tk) gives $Ts."))
     @assert isodd(W) "window length W=$W must be odd"
@@ -153,7 +157,10 @@ function _ka_flash_attention_fwd(
     kr = reshape(k, :, size(k, N-1), size(k, N))
     vr = reshape(v, :, size(v, N-1), size(v, N))
 
-    sc = Ts(scale)
+    # Keep `scale` a concrete real (do NOT convert to the possibly-traced `Ts`):
+    # inside the kernel `typeof(scale)` must be a real type so `typemin`/`zero`
+    # resolve to real numbers; concrete·traced scalar products promote fine.
+    sc = scale
     backend = KernelAbstractions.get_backend(y)
     ka_flash_fwd_kernel!(backend)(
         yr, lse, simfun, qr, kr, vr, nrows, K, C, Cv, spatdims, Int32(W), sc;

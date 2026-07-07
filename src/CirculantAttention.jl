@@ -45,6 +45,10 @@ export circulant_flash_transposed_attention, circulant_mh_flash_transposed_atten
 
 include("batchedmul.jl")
 
+# Traceable array-op forward for the Reactant + Enzyme path (always loaded — pure
+# Julia). The Reactant extension swaps it in during tracing via @reactant_overlay.
+include("reactant_forward.jl")
+
 include("rrules.jl")
 include("zygote.jl")
 

@@ -216,22 +216,42 @@ function circulant_flash_joint_entmax_warp_kernel!(brs, ys, yts, tau, nrows::Int
 end
 
 # ------------------------------------------------------------------
-# forward — block-per-row (TB threads per group; joint reduce = block reduction)
+# forward — block-per-row: stage the concatenated window in shared memory, solve
+# the joint τ over it, apply per branch. Staging computes each score once (vs the
+# warp kernel, which recomputes simval per solver pass) — this is the fast path.
 # ------------------------------------------------------------------
-@inline _joint_apply_block!(::Tuple{}, ::Tuple{}, ::Tuple{}, τ, uinv, r::Int32, b::Int32, lane::Int32, wid::Int32, nwarps::Int32, spatdims, αm1, pe) = nothing
-@inline function _joint_apply_block!(brs::Tuple, ys::Tuple, yts::Tuple, τ, uinv, r::Int32, b::Int32, lane::Int32, wid::Int32, nwarps::Int32, spatdims, αm1, pe)
-    br = first(brs); y_m = first(ys); yt_m = first(yts)
-    sim, q, k, v, W, scale, C, Cv, K = br
-    Tacc = eltype(y_m)
+# stage every branch's scaled window scores + column indices into shared memory
+# (offset `off` = running Σ K_m), so the τ-solve and apply reuse them instead of
+# recomputing simval on every pass — the single-branch block kernel's trick,
+# extended over the concatenated multi-branch window.
+@inline _joint_stage!(z_sh, col_sh, ::Tuple{}, r::Int32, b::Int32, spatdims, αm1, tid::Int32, TB::Int32, off::Int32) = nothing
+@inline function _joint_stage!(z_sh, col_sh, brs::Tuple, r::Int32, b::Int32, spatdims, αm1, tid::Int32, TB::Int32, off::Int32)
+    sim, q, k, _, W, scale, C, _, K = first(brs)
     base = (r - 1i32) * K
+    κ = tid
+    while κ <= K
+        i, _ = cartesian_circulant(base + κ, spatdims, W)
+        @inbounds z_sh[off + κ]   = αm1 * scale * simval(sim, q, k, r, i, b, C)
+        @inbounds col_sh[off + κ] = i
+        κ += TB
+    end
+    _joint_stage!(z_sh, col_sh, Base.tail(brs), r, b, spatdims, αm1, tid, TB, off + K)
+end
+
+# apply per branch from the staged scores (warps over channels, lanes over the
+# branch's entries) — no simval recomputation.
+@inline _joint_apply_block_sh!(::Tuple{}, ::Tuple{}, ::Tuple{}, z_sh, col_sh, τ, uinv, r::Int32, b::Int32, lane::Int32, wid::Int32, nwarps::Int32, pe, off::Int32) = nothing
+@inline function _joint_apply_block_sh!(ys::Tuple, yts::Tuple, brs::Tuple, z_sh, col_sh, τ, uinv, r::Int32, b::Int32, lane::Int32, wid::Int32, nwarps::Int32, pe, off::Int32)
+    y_m = first(ys); yt_m = first(yts)
+    _, _, _, v, _, _, _, Cv, K = first(brs)
+    Tacc = eltype(y_m)
     c = wid
     while c <= Cv
         py = zero(Tacc); pt = zero(Tacc)
         κ = lane
         while κ <= K
-            i, _ = cartesian_circulant(base + κ, spatdims, W)
-            p, u = _entmax_weights(αm1 * scale * simval(sim, q, k, r, i, b, C) - τ, pe)
-            vv = @inbounds v[i, c, b]
+            p, u = _entmax_weights(@inbounds(z_sh[off + κ]) - τ, pe)
+            vv = @inbounds v[col_sh[off + κ], c, b]
             py = muladd(p, vv, py)
             pt = muladd(u * uinv, vv, pt)
             κ += 32i32
@@ -244,10 +264,12 @@ end
         end
         c += nwarps
     end
-    _joint_apply_block!(Base.tail(brs), Base.tail(ys), Base.tail(yts), τ, uinv, r, b, lane, wid, nwarps, spatdims, αm1, pe)
+    _joint_apply_block_sh!(Base.tail(ys), Base.tail(yts), Base.tail(brs), z_sh, col_sh, τ, uinv, r, b, lane, wid, nwarps, pe, off + K)
 end
 
-function circulant_flash_joint_entmax_block_kernel!(brs, ys, yts, tau, nrows::Int32, spatdims, αm1::T, pe::T, ngroups::Int32) where T
+function circulant_flash_joint_entmax_block_kernel!(brs, ys, yts, tau, nrows::Int32, spatdims, αm1::T, pe::T, Ktot::Int32, ngroups::Int32) where T
+    z_sh    = CuDynamicSharedArray(T, Ktot)                            # concatenated window scores
+    col_sh  = CuDynamicSharedArray(Int32, Ktot, Int(Ktot) * sizeof(T))
     scratch = CuStaticSharedArray(T, 32)
     tid    = threadIdx().x
     TB     = blockDim().x
@@ -258,23 +280,44 @@ function circulant_flash_joint_entmax_block_kernel!(brs, ys, yts, tau, nrows::In
     while g <= ngroups
         r = (g - 1i32) % nrows + 1i32
         b = (g - 1i32) ÷ nrows + 1i32
-        zmax = _block_reduce(max, _joint_zmax(typemin(T), brs, r, b, spatdims, αm1, tid, TB), typemin(T), scratch)
+
+        _joint_stage!(z_sh, col_sh, brs, r, b, spatdims, αm1, tid, TB, 0i32)
+        sync_threads()
+
+        # joint max over the concatenated window
+        mloc = typemin(T); e = tid
+        while e <= Ktot
+            mloc = max(mloc, @inbounds(z_sh[e])); e += TB
+        end
+        zmax = _block_reduce(max, mloc, typemin(T), scratch)
+
         t = zmax - T(0.5); tlo = zmax - one(T); thi = zmax
         for _ in 1:_FLASH_ENTMAX_NITER
-            a0l, a1l, a2l = _joint_acc((zero(T), zero(T), zero(T)), brs, t, r, b, spatdims, αm1, pe, tid, TB)
+            a0l = zero(T); a1l = zero(T); a2l = zero(T); e = tid
+            while e <= Ktot
+                d0, d1, d2 = _halley_terms(@inbounds(z_sh[e]) - t, pe)
+                a0l += d0; a1l += d1; a2l += d2; e += TB
+            end
             a0 = _block_reduce(+, a0l, zero(T), scratch)
             a1 = _block_reduce(+, a1l, zero(T), scratch)
             a2 = _block_reduce(+, a2l, zero(T), scratch)
             t, tlo, thi = _halley_step(a0, a1, a2, t, tlo, thi, pe)
         end
         τ = t
-        usum = _block_reduce(+, _joint_usum(zero(T), brs, τ, r, b, spatdims, αm1, pe, tid, TB), zero(T), scratch)
+
+        uloc = zero(T); e = tid
+        while e <= Ktot
+            _, u = _entmax_weights(@inbounds(z_sh[e]) - τ, pe)
+            uloc += u; e += TB
+        end
+        usum = _block_reduce(+, uloc, zero(T), scratch)
         if tid == 1i32
             @inbounds tau[r, b] = τ
         end
         sync_threads()
-        _joint_apply_block!(brs, ys, yts, τ, inv(usum), r, b, lane, wid, nwarps, spatdims, αm1, pe)
-        sync_threads()
+
+        _joint_apply_block_sh!(ys, yts, brs, z_sh, col_sh, τ, inv(usum), r, b, lane, wid, nwarps, pe, 0i32)
+        sync_threads()  # shared reusable for next group
         g += gridDim().x
     end
     return nothing
@@ -305,16 +348,22 @@ function _circulant_flash_joint_entmax_fwd(
     ysr  = map(r3, ys)
     ytsr = map(r3, yts)
 
-    Ktot = sum(Int(Int32(W)^Int32(N-2)) for W in Ws)
+    Ktot  = sum(Int(Int32(W)^Int32(N-2)) for W in Ws)
     WS, NE = _flash_warp_dims(Int32(Ktot))
-    usemode = _flash_mode(mode, NE, 0)          # block staging is recompute-based: no dynamic shmem
+    shmem = Ktot * (sizeof(Ts) + sizeof(Int32))   # staged scores + column indices
+    # The block kernel stages the concatenated window in shared memory (scores
+    # computed once); the warp kernel recomputes simval on every solver pass.
+    # So for :auto prefer block whenever the staged window fits, keeping warp only
+    # as a large-window fallback (and for the mode-agreement test).
+    usemode = mode !== :auto ? mode :
+              (shmem <= _FLASH_BLOCK_MAX_SHMEM ? :block : :warp)
 
     if usemode === :warp
         args = (brs, ysr, ytsr, tau, nrows, spatdims, αm1, pe, maxidx, Val(WS))
         _flash_warp_launch(circulant_flash_joint_entmax_warp_kernel!, args, maxidx, WS)
     elseif usemode === :block
-        args = (brs, ysr, ytsr, tau, nrows, spatdims, αm1, pe, maxidx)
-        _flash_block_launch(circulant_flash_joint_entmax_block_kernel!, args, maxidx, 0)
+        args = (brs, ysr, ytsr, tau, nrows, spatdims, αm1, pe, Int32(Ktot), maxidx)
+        _flash_block_launch(circulant_flash_joint_entmax_block_kernel!, args, maxidx, shmem)
     else
         Tacc = promote_type(Ts, mapreduce(eltype, promote_type, vs))
         args = (brs, ysr, ytsr, tau, nrows, spatdims, αm1, pe, maxidx, _flash_chunk(Tacc))

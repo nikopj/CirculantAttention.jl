@@ -6,6 +6,21 @@
 # used in the joint_sparsemax/joint_entmax tests.
 stretch_support!(W) = (W .+= 2 .* (W .- sum(W; dims=1) ./ size(W, 1)); W)
 
+# The opposite conditioning, for the entmax α-gradient. Center each column and
+# rescale to a small fixed spread (±0.5) so entmax(α∈(1,2]) is DENSE — every
+# entry strictly in-support with clear margin from zero. Stretching (above)
+# drives entmax toward one-hot, where ∂p/∂α ≈ 0 (degenerate) AND the marginal
+# entry sits on the support boundary, so FiniteDifferences' α-step kinks across
+# it and its reference gradient is wrong. In the dense regime both the W- and
+# α-gradients are smooth and FD is reliable, at tight tolerance.
+function densify!(W)
+    m   = sum(W; dims=1) ./ size(W, 1)
+    W .-= m
+    pk  = maximum(abs.(W); dims=1) .+ 1f-6
+    W  .= 0.5f0 .* W ./ pk
+    return W
+end
+
 @testset "Low-level Circulant rrules" begin
 
 for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
@@ -200,7 +215,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
     end
 
     @testset "entmax, α scalar [$tag]" begin
-        W = windowview(real(A)); stretch_support!(W)
+        W = windowview(real(A)); densify!(W)
         ΔW = similar(W); randn!(ΔW)
         V = similar(W); randn!(V)
         test_rrule(entmax, W ⊢ ΔW, 1.5f0 ⊢ (1f0 + rand()), output_tangent=V,
@@ -210,7 +225,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
 
     @testset "entmax, α array [$tag]" begin
         α  = 1f0 .+ CUDA.rand(Float32, 1, 1, 2, 1)
-        W  = windowview(real(A .* α)); stretch_support!(W)
+        W  = windowview(real(A .* α)); densify!(W)
         ΔW = similar(W); randn!(ΔW)
         V  = similar(W); randn!(V)
         Δα = CUDA.rand(Float32, 1, 1, 2, 1)

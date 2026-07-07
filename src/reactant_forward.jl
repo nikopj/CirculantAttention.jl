@@ -63,7 +63,7 @@ Real-valued similarities only.
 function _circ_flash_attention_shift(
         simfun::AbstractSimilarity,
         q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, v::AbstractArray{Tv,N},
-        W::Int, scale::Real=true) where {Tq, Tk, Tv, N}
+        W::Int, scale=true) where {Tq, Tk, Tv, N}   # scale may be a TracedRNumber
     Sdim = N - 2
     cdim = N - 1
     offs = _window_offsets(W, Sdim)

@@ -36,7 +36,9 @@ if REACTANT_OK
 
             @testset "KA forward $tag" begin
                 y_ref = circulant_flash_attention(simfun, q, k, v, ws)
-                y_ka  = @jit CircAtt._ka_flash_attention(simfun, qr, kr, vr, ws, scale)
+                # raise=true lifts the enzymexla.kernel_call back into StableHLO
+                # (needed so the same path is differentiable in the grad test)
+                y_ka = @jit raise=true CircAtt._ka_flash_attention(simfun, qr, kr, vr, ws, scale)
                 @test Array(y_ka) ≈ Array(y_ref)  rtol=1e-4 atol=1e-6
             end
 
@@ -44,7 +46,9 @@ if REACTANT_OK
                 g_ref = Zygote.gradient(
                     (q, k, v) -> sum(abs2, circulant_flash_attention(simfun, q, k, v, ws)),
                     q, k, v)
-                g_re = @jit CircAtt.reactant_flash_grad(simfun, qr, kr, vr, ws, scale)
+                # raise=true is required: without it the KA kernel is an opaque
+                # enzymexla.kernel_call and Enzyme cannot compute its adjoint.
+                g_re = @jit raise=true CircAtt.reactant_flash_grad(simfun, qr, kr, vr, ws, scale)
                 for (gref, gre) in zip(g_ref, g_re)
                     @test Array(gre) ≈ Array(gref)  rtol=1e-3 atol=1e-5
                 end

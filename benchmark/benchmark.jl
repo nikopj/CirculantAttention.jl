@@ -214,7 +214,9 @@ for elty in ELTYPES, tensorsize in TENSORSIZES, windowsize in WINDOWSIZES
     if reactant_on
         # capture simfun/W/scale as constants; only q,k,v are traced arrays
         flashgrad = (q, k, v) -> CircAtt.reactant_flash_grad(DistanceSimilarity(), q, k, v, windowsize, sc)
-        gflash = @compile flashgrad(xr, yr, zr)
+        # raise=true lifts the KA kernel_call into StableHLO so Enzyme can
+        # differentiate it (otherwise the adjoint of the opaque kernel fails)
+        gflash = @compile raise=true flashgrad(xr, yr, zr)
         rec("circulant_flash_attention_gradient", grad_flops,
             () -> gflash(xr, yr, zr); backend="reactant")
     end

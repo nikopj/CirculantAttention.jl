@@ -273,8 +273,9 @@ end
 # unsupported configurations raise informative errors
 @testset "flash error paths" begin
     q = CUDA.randn(Float32, 8, 8, 4, 2)
+    # TopK renormalizes over the full window and remains unfusable. (Sparsemax
+    # and Entmax are now fused — see test/flash_entmax.jl.)
     @test_throws ArgumentError circulant_flash_attention(TopKSimilarity(DotSimilarity(), 3), q, q, q, 5)
-    @test_throws ArgumentError circulant_flash_attention(SparsemaxSimilarity(DotSimilarity()), q, q, q, 5)
 
     qc = CUDA.randn(ComplexF32, 8, 8, 4, 2)
     @test_throws ArgumentError circulant_flash_attention(DotSimilarity(), qc, qc, qc, 5)

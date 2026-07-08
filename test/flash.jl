@@ -270,6 +270,36 @@ end
     end
 end
 
+# Large 2-D windows exercise the sub-warp widths the ws=5 tests never reach:
+# _flash_warp_dims picks WS=16 for ws=9 (K=81) and WS=32 for ws=13 (K=169),
+# whereas every other test only hits WS=8. Validate the warp/block kernels
+# against the CPU-tested thread kernel (fwd, lse, and all gradients).
+@testset "sub-warp widths (large 2D windows)" begin
+    N, d, B = 20, 8, 2
+    for ws in (9, 13)
+        q = CUDA.randn(Float32, N, N, d, B)
+        k = CUDA.randn(Float32, N, N, d, B)
+        v = CUDA.randn(Float32, N, N, d, B)
+        Δ = CUDA.randn(Float32, N, N, d, B)
+        for sim in (DotSimilarity(), DistanceSimilarity())
+            WS, NE = CircAtt._flash_warp_dims(Int32(ws^2))
+            @testset "$(nameof(typeof(sim))) ws=$ws (WS=$WS)" begin
+                yt, lt = CircAtt._circulant_flash_attention_fwd(sim, q, k, v, ws; mode=:thread)
+                gt = CircAtt.∇circulant_flash_attention(sim, Δ, yt, lt, q, k, v, ws; mode=:thread)
+                for m in (:warp, :block)
+                    ym, lm = CircAtt._circulant_flash_attention_fwd(sim, q, k, v, ws; mode=m)
+                    @test Array(ym) ≈ Array(yt)  rtol=1e-4 atol=1e-6
+                    @test Array(lm) ≈ Array(lt)  rtol=1e-4 atol=1e-6
+                    gm = CircAtt.∇circulant_flash_attention(sim, Δ, ym, lm, q, k, v, ws; mode=m)
+                    for (a, b) in zip(gm, gt)
+                        @test Array(a) ≈ Array(b)  rtol=1e-4 atol=1e-6
+                    end
+                end
+            end
+        end
+    end
+end
+
 # unsupported configurations raise informative errors
 @testset "flash error paths" begin
     q = CUDA.randn(Float32, 8, 8, 4, 2)

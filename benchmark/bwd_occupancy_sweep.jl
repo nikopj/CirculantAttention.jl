@@ -24,14 +24,14 @@ r3(x) = reshape(x, :, size(x, N-1), size(x, N))
 lse = CUDA.randn(Float32, Int(nrows), B)
 δ = reshape(sum(real.(Δ .* conj.(y)); dims=N-1), :, B)
 
-function run_variant(WS, NE; minblocks=nothing)
+function run_variant(WS, NE; maxregs=nothing)
     dq = similar(q); dk = similar(k); dv = similar(v)
     args = (r3(dq), r3(dk), r3(dv), sf, r3(q), r3(k), r3(v), r3(Δ), lse, δ,
             nrows, K, Cc, Cv, spatdims, Int32(ws), Ts(1), maxidx, Val(WS), Val(NE))
-    kern = if minblocks === nothing
+    kern = if maxregs === nothing
         @cuda launch=false CA.circulant_flash_attention_bwd_warp_kernel!(args...)
     else
-        @cuda launch=false maxthreads=256 minblocks=minblocks CA.circulant_flash_attention_bwd_warp_kernel!(args...)
+        @cuda launch=false maxregs=maxregs CA.circulant_flash_attention_bwd_warp_kernel!(args...)
     end
     reg = CUDA.registers(kern)
     cfg = launch_configuration(kern.fun)
@@ -56,6 +56,7 @@ report("WS=8  NE=$(cld(Int(K),8)) (default)", ref)
 for WS in (16, 32)
     report("WS=$WS NE=$(cld(Int(K),WS))", run_variant(WS, cld(Int(K), WS)))
 end
-for mb in (5, 6, 8)
-    report("WS=8 minblocks=$mb", run_variant(8, cld(Int(K), 8); minblocks=mb))
+# register caps → target occupancy tiers (256-thread blocks): 51→62.5%, 42→75%, 32→100%
+for mr in (51, 42, 32)
+    report("WS=8 maxregs=$mr", run_variant(8, cld(Int(K), 8); maxregs=mr))
 end

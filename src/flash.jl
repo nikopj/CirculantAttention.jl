@@ -1266,7 +1266,9 @@ renormalize over the wrong axis). No attention matrix is materialized;
 gradients w.r.t. `q`, `k`, `x` are exact.
 
 `q`, `k` must share shape; `x` carries the attended channels. The similarity
-must be real-valued (window-renormalizing similarities are not supported).
+must be real-valued. `EntmaxSimilarity`/`SparsemaxSimilarity` are supported via
+dedicated fused methods (see the `EntmaxSimilarity`/`SparsemaxSimilarity` methods
+of this function); `TopKSimilarity` is not fusable.
 
 See also [`circulant_flash_attention`](@ref),
 [`circulant_mh_flash_transposed_attention`](@ref).

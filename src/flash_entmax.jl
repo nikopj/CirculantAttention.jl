@@ -887,3 +887,91 @@ function circulant_mh_flash_attention(ss::SparsemaxSimilarity, q::AbstractArray{
     yr = circulant_flash_attention(ss, qr, kr, vr, W)
     return reshape(yr, size(v)...)
 end
+
+# ------------------------------------------------------------------
+# transposed flash entmax / sparsemax:  y = Γᵀ x   (Γ = row-entmax(S))
+#
+#   (Γᵀx)_a = Σ_r p_{ra} x_r,   p_{ra} = entmax weight of pair (r,a),
+#   τ_r solved per row from q,k (independent of x).
+#
+# Reuses the fused forward + backward exactly like the softmax transposed
+# (src/flash.jl): Γᵀx is the `dv` output of the entmax backward
+# (∂v_a = Σ_r p_{ra} Δ_r with Δ←x), and ∂q,∂k are the backward's dq,dk with
+# Δ←x, v←Δ̄. The one entmax-specific twist is the per-row shift δ_r = Re⟨x_r, ỹ_r⟩
+# with ỹ = (Σ_a wᵃΔ̄ᵃ)/Σw the u=p^(2-α)-WEIGHTED apply of Δ̄ — not the p-weighted
+# ȳ=ΓΔ̄ (for softmax w=P so the two coincide; entmax needs the distinct
+# weighting, so we thread ỹ, which is the ỹ output of the forward run on Δ̄).
+# No new kernel: the multigrid subgradient path can now use flash entmax/sparsemax.
+# ------------------------------------------------------------------
+
+# Γᵀx given the saved per-row threshold `tau` (value-only, no AD).
+function _flash_entmax_transposed_from_tau(sim::AbstractSimilarity, α::Real, q, k, x, tau, W::Int, scale::Real)
+    zr = zero(x)                                   # y and ỹ are irrelevant to dv (δ unused there)
+    _, _, dv = ∇circulant_flash_entmax(sim, α, x, zr, tau, zr, q, k, zr, W, scale)
+    return dv
+end
+
+function _circulant_flash_entmax_transposed(sim::AbstractSimilarity, α::Real, q, k, x, W::Int, scale::Real=true)
+    _, tau, _ = _circulant_flash_entmax_fwd(sim, α, q, k, x, W, scale)   # τ depends only on q,k
+    return _flash_entmax_transposed_from_tau(sim, α, q, k, x, tau, W, scale)
+end
+
+function CRC.rrule(::typeof(_circulant_flash_entmax_transposed), sim::AbstractSimilarity, α::Real, q, k, x, W::Int, scale::Real)
+    _, tau, _ = _circulant_flash_entmax_fwd(sim, α, q, k, x, W, scale)
+    y = _flash_entmax_transposed_from_tau(sim, α, q, k, x, tau, W, scale)
+    project_q, project_k, project_x = CRC.ProjectTo(q), CRC.ProjectTo(k), CRC.ProjectTo(x)
+    function flash_entmax_transposed_pullback(Δ)
+        Δ̄ = _flash_materialize(Δ, y)
+        ȳ, _, ỹ = _circulant_flash_entmax_fwd(sim, α, q, k, Δ̄, W, scale)   # ȳ=ΓΔ̄ (=∂x); ỹ=u-weighted apply
+        ∂q, ∂k, _ = ∇circulant_flash_entmax(sim, α, x, ȳ, tau, ỹ, q, k, Δ̄, W, scale)
+        return (CRC.NoTangent(), CRC.NoTangent(), CRC.NoTangent(),
+                project_q(∂q), project_k(∂k), project_x(ȳ), CRC.NoTangent(), CRC.NoTangent())
+    end
+    return y, flash_entmax_transposed_pullback
+end
+
+function CRC.rrule(::typeof(_circulant_flash_entmax_transposed), sim::AbstractSimilarity, α::Real, q, k, x, W::Int)
+    y, pb8 = CRC.rrule(_circulant_flash_entmax_transposed, sim, α, q, k, x, W, true)
+    flash_entmax_transposed_pullback7(Δ) = pb8(Δ)[1:7]
+    return y, flash_entmax_transposed_pullback7
+end
+
+@doc raw"""
+    y = circulant_flash_transposed_attention(es::EntmaxSimilarity, q, k, x, W::Int)
+    y = circulant_flash_transposed_attention(ss::SparsemaxSimilarity, q, k, x, W::Int)
+
+Fused (flash) transposed α-entmax / sparsemax apply ``y = Γ^⊤ x`` where
+``Γ = \mathrm{row\text{-}entmax}(S)``. Like the softmax
+[`circulant_flash_transposed_attention`](@ref), no attention matrix is
+materialized and gradients w.r.t. `q`, `k`, `x` are exact (α is a fixed
+hyperparameter). This is what the flash multigrid subgradient (`∂g`) needs.
+"""
+function circulant_flash_transposed_attention(es::EntmaxSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, x::AbstractArray{Tx,N}, W::Int) where {Tq, Tk, Tx, N}
+    abs(Float32(es.α) - 1f0) < _ENTMAX_EPS && return circulant_flash_transposed_attention(es.sim, q, k, x, W)  # softmax
+    scale = inv(sqrt(real(Tk)(size(k, N-1))))
+    _circulant_flash_entmax_transposed(es.sim, es.α, q, k, x, W, scale)
+end
+
+function circulant_flash_transposed_attention(ss::SparsemaxSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, x::AbstractArray{Tx,N}, W::Int) where {Tq, Tk, Tx, N}
+    scale = inv(sqrt(real(Tk)(size(k, N-1))))
+    _circulant_flash_entmax_transposed(ss.sim, 2, q, k, x, W, scale)
+end
+
+@doc raw"""
+    y = circulant_mh_flash_transposed_attention(es::EntmaxSimilarity, q, k, x, W::Int, nheads::Int)
+    y = circulant_mh_flash_transposed_attention(ss::SparsemaxSimilarity, q, k, x, W::Int, nheads::Int)
+
+Multi-head [`circulant_flash_transposed_attention`](@ref) for α-entmax /
+sparsemax (heads folded into the batch dimension).
+"""
+function circulant_mh_flash_transposed_attention(es::EntmaxSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, x::AbstractArray{Tx,N}, W::Int, nheads::Int) where {Tq, Tk, Tx, N}
+    qr, kr, xr = splitheads.((q, k, x), nheads)
+    yr = circulant_flash_transposed_attention(es, qr, kr, xr, W)
+    return reshape(yr, size(x)...)
+end
+
+function circulant_mh_flash_transposed_attention(ss::SparsemaxSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, x::AbstractArray{Tx,N}, W::Int, nheads::Int) where {Tq, Tk, Tx, N}
+    qr, kr, xr = splitheads.((q, k, x), nheads)
+    yr = circulant_flash_transposed_attention(ss, qr, kr, xr, W)
+    return reshape(yr, size(x)...)
+end

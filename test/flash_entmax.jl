@@ -199,6 +199,34 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         @test Array(ξz) ≈ Array(rz)  rtol=1e-4 atol=1e-6
         @test Array(ξg) ≈ Array(rg)  rtol=1e-4 atol=1e-6
     end
+
+    # transposed Γᵀx (used by the multigrid ∂g): flash entmax/sparsemax vs the
+    # materialized entmax-adjacency transpose, the adjoint identity against the
+    # flash forward, and gradients vs the composed path.
+    @testset "transposed [$tag]" begin
+        sim = elty <: Complex ? DistanceSimilarity() : DotSimilarity()
+        scale = inv(sqrt(real(elty)(d)))
+        x = CUDA.randn(elty, size(q)...)
+        entref(mk, q, k, x) = CircAtt.circulant_transposed_attention(
+            circulant_adjacency(mk, q .* sqrt(scale), k .* sqrt(scale), ws), x)
+        for mk in (EntmaxSimilarity(sim, 1.5f0), SparsemaxSimilarity(sim))
+            yt_ref = entref(mk, q, k, x)
+            yt_fl  = circulant_flash_transposed_attention(mk, q, k, x, ws)
+            @test Array(yt_fl) ≈ Array(yt_ref)  rtol=1e-3 atol=1e-5
+
+            # adjoint identity ⟨Γv, x⟩ = ⟨v, Γᵀx⟩ against the flash forward
+            u  = CUDA.randn(elty, size(q)...)
+            Γu = circulant_flash_attention(mk, q, k, u, ws)
+            @test sum(conj.(u) .* yt_fl) ≈ sum(conj.(Γu) .* x)  rtol=1e-3 atol=1e-5
+
+            # gradient vs composed (entmax boundary subgradient → loose tol)
+            g_ref = Zygote.gradient((q,k,x) -> sum(abs2, entref(mk, q, k, x)), q, k, x)
+            g_fl  = Zygote.gradient((q,k,x) -> sum(abs2, circulant_flash_transposed_attention(mk, q, k, x, ws)), q, k, x)
+            for (gr, gf) in zip(g_ref, g_fl)
+                @test Array(gf) ≈ Array(gr)  rtol=1e-2 atol=1e-3
+            end
+        end
+    end
 end
 
 # complex inner similarity (complex scores) is rejected — softmax over complex is

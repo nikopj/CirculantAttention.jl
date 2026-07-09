@@ -132,6 +132,33 @@ row("(b) self flash  W=1",       bf, bb)
 row("(c) guide flash W=9 (G·B)", cf, cb)
 row("(d) host reweight only",    df, db)
 
+# ── mode sweep on the guide branch (the bottleneck) ──────────────────────────
+# The warp/block/thread crossover (_FLASH_WARP_MAX_NE=8) was tuned on REAL
+# DistanceSimilarity; complex entries cost 2× the registers, so :auto may be
+# picking a spilling warp kernel where :block wins. Call the fwd/bwd kernels
+# directly to force each mode. Skips modes that error (e.g. shmem over budget).
+function bench_modes(nbatch, Wwin, label)
+    q, k, v = CUDA.randn(Tqk,H,Wd,Mh,nbatch), CUDA.randn(Tqk,H,Wd,Mh,nbatch), CUDA.rand(Tv,H,Wd,Mh,nbatch)
+    s = scale(k)
+    y, lse = CA._circulant_flash_attention_fwd(sf, q, k, v, Wwin, s)   # :auto reference outputs
+    Δ  = CUDA.rand(Tv, size(y)...)
+    Δl = CUDA.rand(Tv, size(lse)...)
+    _, _, K, _ = CA._flash_launch_dims(q, Wwin)
+    WS, NE = CA._flash_warp_dims(K)
+    @printf("\n  mode sweep — %s  (K=%d, auto: WS=%d NE=%d → %s)\n", label, Int(K), WS, NE,
+            CA._flash_mode(:auto, NE, Int(K)*(sizeof(Float32)+sizeof(Int32))))
+    for m in (:warp, :block, :thread)
+        fwdok = try; CA._circulant_flash_attention_fwd(sf, q, k, v, Wwin, s; mode=m); true
+                catch e; @printf("    %-7s fwd  ERR (%s)\n", m, sprint(showerror,e)[1:min(end,42)]); false end
+        fwdok || continue
+        tf = gputime(() -> CA._circulant_flash_attention_fwd(sf, q, k, v, Wwin, s; mode=m))
+        tb = gputime(() -> CA.∇circulant_flash_attention(sf, Δ, y, lse, q, k, v, Wwin, s; mode=m, Δlse=Δl))
+        @printf("    %-7s fwd %8.3f ms   bwd %8.3f ms   fwd+bwd %8.3f ms\n", m, tf, tb, tf+tb)
+    end
+end
+bench_modes(G*B, Wg, "guide W=9")
+bench_modes(B,   Wz, "self  W=1")
+
 @printf("\n  branch bwd sum  (b)+(c)          = %8.3f ms\n", (bb-bf)+(cb-cf))
 @printf("  measured reweight bwd  (d)        = %8.3f ms\n", db-df)
 @printf("  full bwd (a)                      = %8.3f ms\n", ab-af)

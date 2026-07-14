@@ -882,6 +882,10 @@ function ∇circulant_flash_attention(
     # δ_r = Re⟨Δ[r,:], y[r,:]⟩ = Σ_i P[r,i] g[r,i] — the softmax-pullback shift.
     # A logsumexp cotangent λ enters as ds += λ_r·P[r,i] (since ∂L_r/∂s_ri =
     # P_ri), which folds into the same formula as δ → δ - λ.
+    # `real.(Δ .* conj.(y))` is already a single FUSED broadcast (Julia fuses the nested
+    # dots → one v-sized temp), then reduced. A lazy-Broadcasted reduce to drop that one
+    # temp isn't portably supported (`sum(::Broadcasted; dims)` has no CPU method), and a
+    # custom in-kernel δ would be a large change for ~2% of the backward — not worth it.
     δ = reshape(sum(real.(Δ .* conj.(y)); dims=N-1), :, size(Δ, N))
     if Δlse !== nothing
         δ = δ .- Δlse

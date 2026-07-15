@@ -278,6 +278,79 @@ function circulant_flash_attention_bwd_kernel!(
 end
 
 # ------------------------------------------------------------------
+# atomic-scatter backward  (mode = :scatter)
+#
+# Recompute-once: one thread per (row r, batch b) computes every window pair (r,i)'s
+# (s, α, β, P, ds) ONCE — half the reductions + `exp` of the two-sweep kernels above,
+# which recompute each pair as both a row (∂q) and a column (∂k/∂v). ∂q[r] is
+# single-writer (this thread owns row r) so it accumulates in place; ∂k[i], ∂v[i] are
+# shared across the ~K rows whose window contains i, so they are scattered with atomic
+# adds. The launcher MUST pre-zero dq/dk/dv. Complex ∂k/∂v are passed reinterpreted to
+# real (first dim doubled: re(i)→2i-1, im(i)→2i — CUDA has no complex atomic) and the
+# components are added separately; Val{CPLX} selects the layout. Window-agnostic (fits
+# W=35, unlike the shared-stash scheme), so it targets the production single-grid window
+# directly. Its cost is ~K-way atomic contention on the column outputs — the whole point
+# of benchmarking it against :block. CPU-validated schedule+layout: benchmark/tiled_bwd_validate.jl.
+@inline function _flash_scatter_add!(Ar, i::Int32, c::Int32, b::Int32, val, ::Val{true})
+    ii = i + i                                    # 2i, kept Int32 (re→2i-1, im→2i)
+    CUDA.@atomic Ar[ii - 1i32, c, b] += real(val)
+    CUDA.@atomic Ar[ii,        c, b] += imag(val)
+    return nothing
+end
+@inline function _flash_scatter_add!(Ar, i::Int32, c::Int32, b::Int32, val, ::Val{false})
+    CUDA.@atomic Ar[i, c, b] += real(val)
+    return nothing
+end
+
+@inline function _flash_bwd_scatter_row!(
+        dq, dkr, dvr, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
+        r::Int32, b::Int32, K::Int32, C::Int32, Cv::Int32,
+        spatdims, W::Int32, scale, ::Val{DKC}, ::Val{DVC},
+    ) where {DKC, DVC}
+    base  = (r - 1i32) * K
+    lse_r = @inbounds lse[r, b]
+    δ_r   = @inbounds δ[r, b]
+    for κ in 1i32:K
+        i, _ = cartesian_circulant(base + κ, spatdims, W)
+        s, α, β = simgrad_aux(simfun, q, k, r, i, b, C)      # one C-reduction — ONCE
+        P   = _fastexp(scale * s - lse_r)
+        ds  = P * (_flash_gval(Δ, v, r, i, b, Cv) - δ_r)     # one Cv-reduction — ONCE
+        sds = scale * ds
+        c = 1i32
+        while c <= C
+            qv = @inbounds q[r, c, b]
+            kv = @inbounds k[i, c, b]
+            @inbounds dq[r, c, b] += sds * (α * kv + β * qv)               # single-writer row
+            _flash_scatter_add!(dkr, i, c, b, sds * (conj(α) * qv + β * kv), Val(DKC))
+            c += 1i32
+        end
+        c = 1i32
+        while c <= Cv
+            _flash_scatter_add!(dvr, i, c, b, P * @inbounds(Δ[r, c, b]), Val(DVC))
+            c += 1i32
+        end
+    end
+    return nothing
+end
+
+function circulant_flash_attention_bwd_scatter_kernel!(
+        dq, dkr, dvr, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
+        nrows::Int32, K::Int32, C::Int32, Cv::Int32,
+        spatdims, W::Int32, scale, maxidx::Int32, ::Val{DKC}, ::Val{DVC},
+    ) where {DKC, DVC}
+    tid    = (blockIdx().x - 1i32) * blockDim().x + threadIdx().x
+    stride = gridDim().x * blockDim().x
+    while tid <= maxidx
+        r = (tid - 1i32) % nrows + 1i32
+        b = (tid - 1i32) ÷ nrows + 1i32
+        _flash_bwd_scatter_row!(dq, dkr, dvr, simfun, q, k, v, Δ, lse, δ,
+            r, b, K, C, Cv, spatdims, W, scale, Val(DKC), Val(DVC))
+        tid += stride
+    end
+    return nothing
+end
+
+# ------------------------------------------------------------------
 # warp-cooperative kernels
 #
 # One sub-warp of WS lanes (WS = min(32, nextpow(2, K)), so small 1D windows
@@ -914,6 +987,19 @@ function ∇circulant_flash_attention(
     elseif usemode === :block
         args = (dqr, dkr, dvr, simfun, qr, kr, vr, Δr, lse, δ, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx)
         _flash_block_launch(circulant_flash_attention_bwd_block_kernel!, args, maxidx, shmem)
+    elseif usemode === :scatter
+        # recompute-once, atomic ∂k/∂v scatter (∂q single-writer). Pre-zero all outputs;
+        # complex ∂k/∂v are reinterpreted to real (first dim doubled) for the atomics.
+        fill!(dqr, zero(eltype(dqr))); fill!(dkr, zero(eltype(dkr))); fill!(dvr, zero(eltype(dvr)))
+        DKC = eltype(dkr) <: Complex; DVC = eltype(dvr) <: Complex
+        dks = DKC ? reinterpret(real(eltype(dkr)), dkr) : dkr
+        dvs = DVC ? reinterpret(real(eltype(dvr)), dvr) : dvr
+        args = (dqr, dks, dvs, simfun, qr, kr, vr, Δr, lse, δ, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx, Val(DKC), Val(DVC))
+        kernel = @cuda launch=false circulant_flash_attention_bwd_scatter_kernel!(args...)
+        config = launch_configuration(kernel.fun)
+        threads = min(maxidx, config.threads)
+        blocks  = cld(maxidx, threads)
+        kernel(args...; threads=threads, blocks=blocks)
     else
         chunk = _flash_chunk(promote_type(Tqk, TΔ))
         args = (dqr, dkr, dvr, simfun, qr, kr, vr, Δr, lse, δ, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx, chunk)

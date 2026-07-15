@@ -102,7 +102,9 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
             Δ = CUDA.randn(elty, size(v)...)
             y_t, lse_t = CircAtt._circulant_flash_attention_fwd(simfun, q, k, v, ws; mode=:thread)
             g_t = CircAtt.∇circulant_flash_attention(simfun, Δ, y_t, lse_t, q, k, v, ws; mode=:thread)
-            for mode in (:warp, :block)
+            # :scatter is a bwd-only mode — its fwd falls back to :thread (so y_m/lse_m
+            # match), and its atomic-scattered ∂q/∂k/∂v must agree with the two-sweep bwd.
+            for mode in (:warp, :block, :scatter)
                 y_m, lse_m = CircAtt._circulant_flash_attention_fwd(simfun, q, k, v, ws; mode)
                 @test Array(y_m)   ≈ Array(y_t)    rtol=1e-5 atol=1e-7
                 @test Array(lse_m) ≈ Array(lse_t)  rtol=1e-5 atol=1e-7

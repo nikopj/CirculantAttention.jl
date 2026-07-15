@@ -821,6 +821,104 @@ function circulant_flash_attention_bwd_block_kernel!(
     return nothing
 end
 
+# block-per-row recompute-once backward  (mode = :bscatter)
+#
+# Keeps sweep 1 of the two-sweep block kernel above (compute each pair (a,i)'s (s,α,P,ds)
+# ONCE, ∂q[a] local via warps-over-channels), but REPLACES the pair-recomputing sweep 2
+# with an atomic scatter of ∂k/∂v to their columns from the SAME staged values — halving
+# the per-pair reductions + `exp` (the issue-bound cost) while keeping block parallelism.
+# ∂k[i] += conj(sds·α)·q[a] + β·sds·k[i];  ∂v[i] += P·Δ[a], summed over the rows a whose
+# window contains i by the atomics. Stages one extra shared array (sds) vs :block. dk/dv
+# pre-zeroed by launcher; ∂q single-writer (=); complex ∂k/∂v reinterpreted to real for the
+# atomics (Val{CPLX}). Same CPU-validated recompute-once schedule as :scatter.
+function circulant_flash_attention_bwd_scatter_block_kernel!(
+        dq, dkr, dvr, simfun::AbstractSimilarity, q, k, v, Δ, lse, δ,
+        nrows::Int32, K::Int32, C::Int32, Cv::Int32,
+        spatdims, W::Int32, scale, ngroups::Int32, ::Val{DKC}, ::Val{DVC},
+    ) where {DKC, DVC}
+    Tq = eltype(q); Tk = eltype(k); TΔ = eltype(Δ)
+    Ts, Tds, Tw = _flash_bwd_wtypes(simfun, Tq, Tk, TΔ, eltype(v))
+    Tqk = promote_type(Tq, Tk)
+    β   = _simgrad_beta(simfun, Tqk)
+    # largest-aligned first: u (Tw), P (Ts), sds (Tds), cols (Int32)
+    u_sh    = CuDynamicSharedArray(Tw,  K)
+    P_sh    = CuDynamicSharedArray(Ts,  K, Int(K) * sizeof(Tw))
+    sds_sh  = CuDynamicSharedArray(Tds, K, Int(K) * (sizeof(Tw) + sizeof(Ts)))
+    col_sh  = CuDynamicSharedArray(Int32, K, Int(K) * (sizeof(Tw) + sizeof(Ts) + sizeof(Tds)))
+    scratch = CuStaticSharedArray(Tds, 32)
+
+    tid    = threadIdx().x
+    TB     = blockDim().x
+    lane   = (tid - 1i32) % 32i32 + 1i32
+    wid    = (tid - 1i32) ÷ 32i32 + 1i32
+    nwarps = TB ÷ 32i32
+
+    g = blockIdx().x
+    while g <= ngroups
+        a = (g - 1i32) % nrows + 1i32
+        b = (g - 1i32) ÷ nrows + 1i32
+        base  = (a - 1i32) * K
+        lse_a = @inbounds lse[a, b]
+        δ_a   = @inbounds δ[a, b]
+
+        # compute each pair ONCE: stage col, sds·α, P, sds; accumulate Σ sds
+        dsloc = zero(Tds)
+        κ = tid
+        while κ <= K
+            i, _ = cartesian_circulant(base + κ, spatdims, W)
+            s, α, _ = simgrad_aux(simfun, q, k, a, i, b, C)
+            P   = _fastexp(scale * s - lse_a)
+            sds = scale * (P * (_flash_gval(Δ, v, a, i, b, Cv) - δ_a))
+            @inbounds col_sh[κ] = i
+            @inbounds u_sh[κ]   = sds * α
+            @inbounds P_sh[κ]   = P
+            @inbounds sds_sh[κ] = sds
+            dsloc += sds
+            κ += TB
+        end
+        ds1 = _block_reduce(+, dsloc, zero(Tds), scratch)   # internal sync barriers the staging
+
+        # ∂q[a] — single-writer, warps over channels, lanes over window entries
+        c = wid
+        while c <= C
+            p = zero(Tqk)
+            κ = lane
+            while κ <= K
+                p += @inbounds(u_sh[κ]) * @inbounds(k[col_sh[κ], c, b])
+                κ += 32i32
+            end
+            p = _warp_reduce(+, p, 0xffffffff, Val(32))
+            if lane == 1i32
+                @inbounds dq[a, c, b] = p + β * ds1 * @inbounds(q[a, c, b])
+            end
+            c += nwarps
+        end
+
+        # ∂k[i], ∂v[i] — atomic scatter from the staged values (no sweep-2 recompute)
+        κ = tid
+        while κ <= K
+            @inbounds i   = col_sh[κ]
+            @inbounds uk  = conj(u_sh[κ])              # sds·conj(α)  (sds real ⇒ conj folds)
+            @inbounds sds = sds_sh[κ]
+            @inbounds Pκ  = P_sh[κ]
+            c = 1i32
+            while c <= C
+                _flash_scatter_add!(dkr, i, c, b, uk * @inbounds(q[a, c, b]) + β * sds * @inbounds(k[i, c, b]), Val(DKC))
+                c += 1i32
+            end
+            c = 1i32
+            while c <= Cv
+                _flash_scatter_add!(dvr, i, c, b, Pκ * @inbounds(Δ[a, c, b]), Val(DVC))
+                c += 1i32
+            end
+            κ += TB
+        end
+        sync_threads()   # shared safe to overwrite for the next group
+        g += gridDim().x
+    end
+    return nothing
+end
+
 # ------------------------------------------------------------------
 # host-side launchers (inputs already scaled)
 # ------------------------------------------------------------------
@@ -968,7 +1066,7 @@ function ∇circulant_flash_attention(
     C  = Int32(size(q, N-1))
     Cv = Int32(size(v, N-1))
     WS, NE = _flash_warp_dims(K)
-    Ts, _, Tw = _flash_bwd_wtypes(simfun, Tq, Tk, TΔ, Tv)
+    Ts, Tds, Tw = _flash_bwd_wtypes(simfun, Tq, Tk, TΔ, Tv)
     shmem = Int(K) * (sizeof(Tw) + sizeof(Ts) + sizeof(Int32))
     usemode = _flash_mode(mode, NE, shmem)
 
@@ -1000,6 +1098,17 @@ function ∇circulant_flash_attention(
         threads = min(maxidx, config.threads)
         blocks  = cld(maxidx, threads)
         kernel(args...; threads=threads, blocks=blocks)
+    elseif usemode === :bscatter
+        # block-per-row recompute-once: sweep-1 ∂q local + atomic ∂k/∂v scatter (no sweep 2).
+        # Extra shared array (sds) over :block ⇒ shmem += K·sizeof(Tds). Pre-zero dk/dv only
+        # (∂q is single-writer =); complex ∂k/∂v reinterpreted to real for the atomics.
+        fill!(dkr, zero(eltype(dkr))); fill!(dvr, zero(eltype(dvr)))
+        DKC = eltype(dkr) <: Complex; DVC = eltype(dvr) <: Complex
+        dks = DKC ? reinterpret(real(eltype(dkr)), dkr) : dkr
+        dvs = DVC ? reinterpret(real(eltype(dvr)), dvr) : dvr
+        shmem_bs = shmem + Int(K) * sizeof(Tds)
+        args = (dqr, dks, dvs, simfun, qr, kr, vr, Δr, lse, δ, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx, Val(DKC), Val(DVC))
+        _flash_block_launch(circulant_flash_attention_bwd_scatter_block_kernel!, args, maxidx, shmem_bs)
     else
         chunk = _flash_chunk(promote_type(Tqk, TΔ))
         args = (dqr, dkr, dvr, simfun, qr, kr, vr, Δr, lse, δ, nrows, K, C, Cv, spatdims, Int32(W), sc, maxidx, chunk)

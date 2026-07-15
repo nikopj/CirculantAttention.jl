@@ -64,7 +64,8 @@ run_fwd() = CA._circulant_flash_attention_fwd(simfun, q, k, v, WS; mode = MODE)
 
 # exact CUDA kernel name for this (dir,mode), for the ncu --kernel-name filter.
 # :scatter is a bwd-only mode (fwd falls back to :thread for the y/lse setup).
-_suffix(m) = m === :warp ? "warp_" : m === :block ? "block_" : m === :scatter ? "scatter_" : ""
+_suffix(m) = m === :warp ? "warp_" : m === :block ? "block_" :
+             m === :scatter ? "scatter_" : m === :bscatter ? "scatter_block_" : ""
 kernel_name = DIR === :fwd ?
     "circulant_flash_attention_$(_suffix(MODE))kernel" :
     "circulant_flash_attention_bwd_$(_suffix(MODE))kernel"

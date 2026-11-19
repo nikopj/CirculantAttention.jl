@@ -1,4 +1,4 @@
-# test/rrule.jl
+# test/attention.jl
 # Tests for circulant_similarity and circulant_attention rrules.
 
 @testset "Similarity and Attention" begin 

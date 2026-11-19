@@ -1,7 +1,7 @@
 # benchmark/guided_profile.jl
 #
 # Decompose the guided-joint flash attention backward to find where time goes.
-# The guided prox (Sljiva GuidedGroupFlashThresholding{true,true}) calls
+# The guided proximal map of LGGS (self + multi-guide joint attention) calls
 # `circulant_mh_flash_guided_joint_attention`, whose backward = two hand-written
 # `_circulant_flash_attention_lse` rrules (self + all-guides-batched) PLUS a
 # host-side joint-softmax reweight that is differentiated by Zygote source-to-source.

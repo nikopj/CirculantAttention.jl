@@ -1,3 +1,11 @@
+"""
+    CirculantAttention
+
+Sliding-window ("circulant-sparse") attention for CUDA arrays: the attention matrix has a
+window of odd width around every pixel of a 1-D or 2-D signal, with periodic boundaries.
+It is either materialized as a [`Circulant`](@ref) matrix or fused into flash kernels.
+Also available as `CircAtt`.
+"""
 module CirculantAttention
 
 const CircAtt = CirculantAttention
@@ -43,8 +51,8 @@ export circulant_flash_attention, circulant_mh_flash_attention, circulant_flash_
 export circulant_mh_flash_joint_attention, circulant_mh_flash_guided_joint_attention
 export circulant_flash_transposed_attention, circulant_mh_flash_transposed_attention
 
-# fused (flash) α-entmax / sparsemax attention — extends circulant_flash_attention
-# and circulant_mh_flash_attention for EntmaxSimilarity / SparsemaxSimilarity.
+# fused (flash) α-entmax / sparsemax attention — extends the flash functions
+# for EntmaxSimilarity / SparsemaxSimilarity.
 include("flash_entmax.jl")
 
 # fused (flash) JOINT + guided α-entmax / sparsemax over multiple branches.

@@ -901,7 +901,7 @@ end
 # with ỹ = (Σ_a wᵃΔ̄ᵃ)/Σw the u=p^(2-α)-WEIGHTED apply of Δ̄ — not the p-weighted
 # ȳ=ΓΔ̄ (for softmax w=P so the two coincide; entmax needs the distinct
 # weighting, so we thread ỹ, which is the ỹ output of the forward run on Δ̄).
-# No new kernel: the multigrid subgradient path can now use flash entmax/sparsemax.
+# No new kernel is needed.
 # ------------------------------------------------------------------
 
 # Γᵀx given the saved per-row threshold `tau` (value-only, no AD).
@@ -944,7 +944,7 @@ Fused (flash) transposed α-entmax / sparsemax apply ``y = Γ^⊤ x`` where
 ``Γ = \mathrm{row\text{-}entmax}(S)``. Like the softmax
 [`circulant_flash_transposed_attention`](@ref), no attention matrix is
 materialized and gradients w.r.t. `q`, `k`, `x` are exact (α is a fixed
-hyperparameter). This is what the flash multigrid subgradient (`∂g`) needs.
+hyperparameter).
 """
 function circulant_flash_transposed_attention(es::EntmaxSimilarity, q::AbstractArray{Tq,N}, k::AbstractArray{Tk,N}, x::AbstractArray{Tx,N}, W::Int) where {Tq, Tk, Tx, N}
     abs(Float32(es.α) - 1f0) < _ENTMAX_EPS && return circulant_flash_transposed_attention(es.sim, q, k, x, W)  # softmax

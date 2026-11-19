@@ -13,7 +13,7 @@ simval_dtype(sf::AbstractSimilarity, ::AbstractArray{Tx}, ::AbstractArray{Ty}) w
 # On LLVM ≥ 17 the automatic loop-strength-reduction of the multidim access
 # x[Ci,m,b] regressed — it recomputes each element's address with a
 # per-iteration `mul.lo.s64` instead of a constant-stride pointer bump (see
-# benchmark/TOOLCHAIN_REGRESSION_REPORT.md), ~1.2–1.8× slower. We hand it
+# benchmark/toolchain_regression_mwe.jl), ~1.2–1.8× slower. We hand it
 # linear indices stepped by `nrows` so the pointer increment is explicit. On
 # LLVM 16 the multidim form is already optimal (and the linear form is slower),
 # so we keep it. The branch is resolved at compile time by @static.
@@ -136,6 +136,12 @@ function circulant_similarity(simfun::AbstractSimilarity, x::AbstractArray{Tx,N}
     return S
 end
 
+"""
+    circulant_similarity!(A::Circulant, simfun, x, y)
+
+In-place [`circulant_similarity`](@ref): overwrites the values of `A`, whose window and
+size must match `x` and `y`. Returns `A`.
+"""
 function circulant_similarity!(A::Circulant{T, N}, simfun, x, y) where {T, N}
     circulant_similarity!(reshape(A, :, :, :), simfun, x, y)
     return A
@@ -218,6 +224,11 @@ end
 # Both components are AD-traceable so this composes for free.
 # ------------------------------------------------------------------------------
 
+"""
+    circulant_adjacency!(A::Circulant, simfun, x, y)
+
+In-place [`circulant_adjacency`](@ref): row softmax of the similarities, written to `A`.
+"""
 function circulant_adjacency!(A::Circulant, simfun, x, y)
     circulant_similarity!(A, simfun, x, y)
     NNlib.softmax!(A)
@@ -233,6 +244,17 @@ function circulant_adjacency(simfun::AbstractSimilarity, x, y, W::Integer)
     NNlib.softmax(circulant_similarity(simfun, x, y, W))
 end
 
+"""
+    joint_softmax(A₁, A₂, …)
+
+Softmax normalized jointly over the window entries of several [`Circulant`](@ref)
+matrices: for every row (and head and batch index), the entries of all `Aₘ` together sum
+to one. The matrices must have the same size and may differ in window width. Returns a
+tuple of `Circulant`s with the sparsity patterns of the inputs.
+
+See also [`joint_sparsemax`](@ref), [`joint_entmax`](@ref),
+[`circulant_flash_joint_attention`](@ref).
+"""
 function joint_softmax(As::Circulant...)
     Ws   = map(windowview, As)
     Wcat = cat(Ws...; dims=1)               # (sum(nnz_per_row), n_rows, ch..., batch)

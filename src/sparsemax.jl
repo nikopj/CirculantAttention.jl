@@ -2,6 +2,13 @@
 # SparsemaxSimilarity
 # ==============================================================================
 
+"""
+    SparsemaxSimilarity(sim)
+
+Normalizes the similarities `sim` of each row with [`sparsemax`](@ref) instead of the
+softmax, so that attention weights outside a data-dependent support are exactly zero.
+Supported by [`circulant_attention`](@ref) and the flash functions.
+"""
 struct SparsemaxSimilarity{S<:AbstractSimilarity} <: AbstractSimilarity
     sim::S
 end
@@ -22,6 +29,14 @@ function _sparsemax_threshold(W::CuArray)
     return τ
 end
 
+"""
+    sparsemax(W)
+    sparsemax(A::Circulant)
+
+Sparsemax (Martins & Astudillo, 2016) along the first dimension of `W`, or over the
+window entries of each row of `A`: the Euclidean projection onto the probability simplex,
+`max.(W .- τ, 0)` with the threshold `τ` chosen so that each column sums to one.
+"""
 function sparsemax(W::AbstractArray{T}) where T
     τ = _sparsemax_threshold(W)
     max.(W .- τ, zero(T))
@@ -36,6 +51,12 @@ function circulant_adjacency(ss::SparsemaxSimilarity, x, y, W::Integer)
     _circ_from_window(Yw, A)
 end
 
+"""
+    joint_sparsemax(A₁, A₂, …)
+
+[`sparsemax`](@ref) normalized jointly over the window entries of several
+[`Circulant`](@ref) matrices, as in [`joint_softmax`](@ref).
+"""
 function joint_sparsemax(As::Circulant...)
     Ws      = map(windowview, As)
     Wcat    = cat(Ws...; dims=1)

@@ -119,4 +119,3 @@ function cucirculant(M::Int, N1::Int, N2::Int, Tv=Float32, Ti=Int32)
 end
 
 CRC.@non_differentiable cucirculant(::Any...)
-Zygote.@nograd cucirculant

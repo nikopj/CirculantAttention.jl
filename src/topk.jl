@@ -1,7 +1,11 @@
-# ==============================================================================
-# TopKSimilarity — wraps any similarity, keeps top-k entries per row before
-# softmax normalization. K is stored as a hyperparameter.
-# ==============================================================================
+"""
+    TopKSimilarity(sim, k)
+
+Keeps the `k` largest similarities `sim` of each row: [`circulant_similarity`](@ref) sets
+the others to `-Inf`, and [`circulant_adjacency`](@ref) (hence
+[`circulant_attention`](@ref)) applies the softmax over the remaining entries. Gradients
+treat the selection as fixed. Not supported by the flash functions.
+"""
 struct TopKSimilarity{S<:AbstractSimilarity} <: AbstractSimilarity
     sim::S
     k::Int

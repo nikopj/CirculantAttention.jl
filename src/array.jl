@@ -1,4 +1,21 @@
 # array.jl
+"""
+    Circulant{T}(M, (spatial..., h, b))
+    Circulant(data, M, spatial_size)
+
+Batched circulant-sparse matrix of size `(P, P, h, b)`, where `P = prod(spatial)` is the
+number of pixels of a 1-D or 2-D signal and row `i` holds the `M^S` entries (`S` spatial
+dimensions) of the window of odd width `M` centred on pixel `i`, with periodic
+boundaries. The values are stored in a batched `CuSparseArrayCSR` (`A.data`) and exposed
+as a dense array by [`windowview`](@ref).
+
+`Circulant{T}(M, dims)` allocates one with all values one (`T = Float32` by default);
+usually they come from [`circulant_similarity`](@ref) and [`circulant_adjacency`](@ref).
+Circulant matrices support `+`, `-`, broadcasting over their values (e.g. `m .* A` with
+`m` of size `(1, 1, h, b)`), `sum(A; dims)`, `cat(A, B; dims=3)`, `reshape` and `dot`, and
+are applied to signals with [`⊗`](@ref circulant_attention) and
+[`⨷`](@ref circulant_mh_attention).
+"""
 struct Circulant{T, N, M, S, A<:AbstractArray{T, N}} <: AbstractArray{T, N}
     data::A
     kernel_length::Int
@@ -72,16 +89,28 @@ end
 
 CUDA.unsafe_free!(A::Circulant) = CUDA.unsafe_free!(A.data)
 
+"""
+    circulant(M, x)
+
+All-ones [`Circulant`](@ref) with window width `M` for the spatial size and batch of `x`,
+a `(spatial..., channels, batch)` array, with element type `real(eltype(x))`.
+"""
 circulant(M::Int, x::AnyCuArray{T, N}) where {T,N} = Circulant{real(T)}(M, (size(x)[1:N-2]..., 1, size(x,N)))
 
+"Window width `M` of `A` (odd); each row has `M^spatial_dims(A)` entries."
 kernel_length(A::Circulant{T, N, M}) where {T, N, M} = M
+"Number of spatial dimensions (1 or 2) of the signals `A` acts on."
 spatial_dims(A::Circulant{T, N, M, S}) where {T, N, M, S} = S
+"Spatial size of the signals `A` acts on; `prod(spatial_size(A)) == size(A, 1)`."
 spatial_size(A::Circulant) = A.spatial_size
 
-# ------------------------------------------------------------------------------
-# windowview: canonical (nnz_per_row, n_rows, batch...) view of nzVal.
-# Used throughout to avoid manual reshape arithmetic.
-# ------------------------------------------------------------------------------
+"""
+    windowview(A::Circulant)
+
+The values of `A` as a dense `(M^S, P, h, b)` array sharing memory with `A`:
+`windowview(A)[k, i, ...]` is the `k`-th window entry of row `i`. The normalizations
+(softmax, [`sparsemax`](@ref), [`entmax`](@ref)) act along its first dimension.
+"""
 windowview(A::Circulant) = windowview(A.data)
 windowview(A::CuSparseArrayCSR) = reshape(A.nzVal, :, A.dims[1], A.dims[3:end]...)
 

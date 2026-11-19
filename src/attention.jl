@@ -47,6 +47,13 @@ end
 circulant_mh_attention(q::AbstractArray, k::AbstractArray, v::AbstractArray, W::Int, nheads::Int) = circulant_mh_attention(DotSimilarity(), q, k, v, W, nheads)
 splitheads(x::AbstractArray{T,N}, nheads) where {T,N} = reshape(x, ntuple(i->size(x,i), N-2)..., size(x, N-1) ÷ nheads, :)
 
+"""
+    A = circulant_mh_adjacency(simfun, x, y, W::Int, nheads::Int)
+
+Multi-head [`circulant_adjacency`](@ref): splits the channels of `x` and `y` into `nheads`
+groups and returns the row-softmax adjacency of each, with `size(A, 3) == nheads`. Unlike
+[`circulant_mh_attention`](@ref), the inputs are not rescaled.
+"""
 function circulant_mh_adjacency(simfun, x::AbstractArray{T,N}, y, W::Integer, nheads::Int) where {T, N}
     xr, yr = splitheads.((x, y), nheads)
     A = circulant_adjacency(simfun, xr, yr, W)

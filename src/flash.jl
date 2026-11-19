@@ -1411,8 +1411,8 @@ end
 #    the gradient is exact even though L is recomputed rather than threaded).
 #
 # A dedicated fused kernel would avoid the wasted dq/dk/y compute below; this
-# reuse keeps the column-sweep on the tested code path and is used on the
-# multigrid subgradient, not the hot per-iteration prox.
+# reuse keeps the column-sweep on the tested code path; the transposed apply is
+# typically needed off the hot path (e.g. for subgradients of adjoint operators).
 # ------------------------------------------------------------------
 
 # Γᵀx given the per-row logsumexp `lse` (value-only, no AD).

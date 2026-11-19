@@ -3,16 +3,24 @@
 #
 # Generalizes softmax (α→1) and sparsemax (α=2).
 # For general α ∈ (1,2], threshold τ is found via bisection on the GPU.
-# α is stored as a scalar hyperparameter in the struct; the Lux layer
-# (LuxExt.jl) promotes it to a learnable per-head AbstractArray.
 #
 # Forward:  p_i = max((α-1)*z_i - τ, 0)^(1/(α-1)),  sum(p) = 1
 # Backward: implicit function theorem — bisection is not differentiated.
 # ==============================================================================
 
+"""
+    EntmaxSimilarity(sim, α)
+
+Normalizes the similarities `sim` of each row with α-[`entmax`](@ref) instead of the
+softmax: `α → 1` recovers the softmax and `α = 2` sparsemax, and values in between give
+attention weights of intermediate sparsity. `α` is a fixed hyperparameter (not
+differentiated); for a learnable `α`, apply [`entmax`](@ref) to the output of
+[`circulant_similarity`](@ref). Supported by [`circulant_attention`](@ref) and the flash
+functions.
+"""
 struct EntmaxSimilarity{S<:AbstractSimilarity} <: AbstractSimilarity
     sim::S
-    α::Float32   # scalar init value; use EntmaxAttention Lux layer for learned α
+    α::Float32
 end
 
 const _ENTMAX_BISECT_ITERS = 50
@@ -38,6 +46,16 @@ function _entmax_threshold(W::AbstractArray{T}, α) where T
     return (τ_lo .+ τ_hi) ./ T(2)
 end
 
+"""
+    entmax(W, α)
+    entmax(A::Circulant, α)
+
+α-entmax (Peters et al., 2019) along the first dimension of `W`, or over the window
+entries of each row of `A`: `max.((α - 1) .* W .- τ, 0) .^ (1 / (α - 1))`, with the
+threshold `τ` (found by bisection) chosen so that each column sums to one. `α ∈ (1, 2]` is
+a number or an array broadcastable against `W` (e.g. one value per head); a scalar `α ≈ 1`
+or `α ≈ 2` gives the softmax or [`sparsemax`](@ref). Differentiable in `W` and `α`.
+"""
 function entmax(W::AbstractArray{T}, α) where T
     if α isa Real
         abs(T(α - 1)) < _ENTMAX_EPS && return NNlib.softmax(W; dims=1)
@@ -59,6 +77,12 @@ function circulant_adjacency(es::EntmaxSimilarity, x, y, W::Integer)
     _circ_from_window(entmax(windowview(A), es.α), A)
 end
 
+"""
+    joint_entmax(α, A₁, A₂, …)
+
+[`entmax`](@ref) normalized jointly over the window entries of several
+[`Circulant`](@ref) matrices, as in [`joint_softmax`](@ref). Differentiable in `α` too.
+"""
 function joint_entmax(α, As::Circulant...)
     Ws      = map(windowview, As)
     Wcat    = cat(Ws...; dims=1)

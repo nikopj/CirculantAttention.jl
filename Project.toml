@@ -1,13 +1,15 @@
 name = "CirculantAttention"
 uuid = "84d5bf51-c9fe-456b-b992-3a1345f8cdeb"
 authors = ["nikopj"]
-version = "1.0.2"
+version = "1.1.0"
 
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 ChainRules = "082447d4-558c-5d27-93f4-14fc19e9eca2"
 ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MLUtils = "f1d291b0-491e-4a28-83b9-f70985020b54"
 NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
@@ -17,21 +19,24 @@ cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [compat]
 Adapt = "4, 5"
-CUDA = "5.4"
+CUDA = "5, 6"
 ChainRules = "1"
 ChainRulesCore = "1"
+GPUArrays = "11"
+KernelAbstractions = "0.9"
 LinearAlgebra = "1"
 MLUtils = "0.4"
 NNlib = "0.9"
 SparseArrays = "1"
-Zygote = "0.6"
-cuDNN = "1"
-julia = "1.9, 1.10, 1.11"
+Zygote = "0.7"
+cuDNN = "1, 6"
+julia = "1.11, 1.12"
 
 [extras]
 ChainRulesTestUtils = "cdddcdb0-9152-4a09-a978-84456f9df70a"
 FiniteDifferences = "26cc04aa-876d-5657-8c51-4c34ba976000"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "ChainRulesTestUtils", "FiniteDifferences"]
+test = ["Test", "ChainRulesTestUtils", "FiniteDifferences", "Random"]

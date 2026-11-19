@@ -80,71 +80,71 @@ function NNlib.batched_mul!(C::BatchedCuDense{<:Complex}, A::BatchedCuSparse{<:C
 end
 
 function NNlib.batched_mul!(
-        C::DenseCuArray{T},
-        A::CUSPARSE.CuSparseArrayCSR{T},
-        B::DenseCuArray{T},
-        α::Number=one(T),
-        β::Number=zero(T)) where T
+        C::DenseCuArray{Tc},
+        A::CUSPARSE.CuSparseArrayCSR{Ta},
+        B::DenseCuArray{Tb},
+        α::Number=one(Tc),
+        β::Number=zero(Tc)) where {Ta, Tb, Tc}
     CUSPARSE.bmm!('N', 'N', α, A, B, β, C, 'O')
     return C
 end
 
 function NNlib.batched_mul!(
-        C::DenseCuArray{T},
-        A::CUSPARSE.CuSparseArrayCSR{T},
-        B::NNlib.BatchedTranspose{T},
-        α::Number=one(T),
-        β::Number=zero(T)) where T
+        C::DenseCuArray{Tc},
+        A::CUSPARSE.CuSparseArrayCSR{Ta},
+        B::NNlib.BatchedTranspose{Tb},
+        α::Number=one(Tc),
+        β::Number=zero(Tc)) where {Ta, Tb, Tc}
     CUSPARSE.bmm!('N', 'T', α, A, B.parent, β, C, 'O')
     return C
 end
 
 function NNlib.batched_mul!(
-        C::DenseCuArray{T},
-        A::NNlib.BatchedTranspose{T, <:CUSPARSE.CuSparseArrayCSR},
-        B::DenseCuArray{T},
-        α::Number=one(T),
-        β::Number=zero(T)) where T
+        C::DenseCuArray{Tc},
+        A::NNlib.BatchedTranspose{Ta, <:CUSPARSE.CuSparseArrayCSR},
+        B::DenseCuArray{Tb},
+        α::Number=one(Tc),
+        β::Number=zero(Tc)) where {Ta, Tb, Tc}
     CUSPARSE.bmm!('T', 'N', α, A.parent, B, β, C, 'O')
     return C
 end
 
 function NNlib.batched_mul!(
-        C::DenseCuArray{T},
-        A::NNlib.BatchedTranspose{T, <:CUSPARSE.CuSparseArrayCSR},
-        B::NNlib.BatchedTranspose{T},
-        α::Number=one(T),
-        β::Number=zero(T)) where T
+        C::DenseCuArray{Tc},
+        A::NNlib.BatchedTranspose{Ta, <:CUSPARSE.CuSparseArrayCSR},
+        B::NNlib.BatchedTranspose{Tb},
+        α::Number=one(Tc),
+        β::Number=zero(Tc)) where {Ta, Tb, Tc}
     CUSPARSE.bmm!('T', 'T', α, A.parent, B.parent, β, C, 'O')
     return C
 end
 
 function NNlib.batched_mul!(
-        C::DenseCuArray{T},
-        A::CUSPARSE.CuSparseArrayCSR{T},
-        B::NNlib.BatchedAdjoint{T},
-        α::Number=one(T),
-        β::Number=zero(T)) where T
+        C::DenseCuArray{Tc},
+        A::CUSPARSE.CuSparseArrayCSR{Ta},
+        B::NNlib.BatchedAdjoint{Tb},
+        α::Number=one(Tc),
+        β::Number=zero(Tc)) where {Ta, Tb, Tc}
     CUSPARSE.bmm!('N', 'C', α, A, B.parent, β, C, 'O')
     return C
 end
 
 function NNlib.batched_mul!(
-        C::DenseCuArray{T},
-        A::NNlib.BatchedAdjoint{T, <:CUSPARSE.CuSparseArrayCSR},
-        B::DenseCuArray{T},
-        α::Number=one(T),
-        β::Number=zero(T)) where T
+        C::DenseCuArray{Tc},
+        A::NNlib.BatchedAdjoint{Ta, <:CUSPARSE.CuSparseArrayCSR},
+        B::DenseCuArray{Tb},
+        α::Number=one(Tc),
+        β::Number=zero(Tc)) where {Ta, Tb, Tc}
     CUSPARSE.bmm!('C', 'N', α, A.parent, B, β, C, 'O')
     return C
 end
 
 function NNlib.batched_mul!(
-        C::DenseCuArray{T},
-        A::NNlib.BatchedAdjoint{T, <:CUSPARSE.CuSparseArrayCSR},
-        B::NNlib.BatchedAdjoint{T},
-        α::Number=one(T),
-        β::Number=zero(T)) where T
+        C::DenseCuArray{Tc},
+        A::NNlib.BatchedAdjoint{Ta, <:CUSPARSE.CuSparseArrayCSR},
+        B::NNlib.BatchedAdjoint{Tb},
+        α::Number=one(Tc),
+        β::Number=zero(Tc)) where {Ta, Tb, Tc}
     CUSPARSE.bmm!('C', 'C', α, A.parent, B.parent, β, C, 'O')
     return C
 end

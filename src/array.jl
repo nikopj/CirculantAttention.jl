@@ -1,3 +1,21 @@
+# array.jl
+"""
+    Circulant{T}(M, (spatial..., h, b))
+    Circulant(data, M, spatial_size)
+
+Batched circulant-sparse matrix of size `(P, P, h, b)`, where `P = prod(spatial)` is the
+number of pixels of a 1-D or 2-D signal and row `i` holds the `M^S` entries (`S` spatial
+dimensions) of the window of odd width `M` centred on pixel `i`, with periodic
+boundaries. The values are stored in a batched `CuSparseArrayCSR` (`A.data`) and exposed
+as a dense array by [`windowview`](@ref).
+
+`Circulant{T}(M, dims)` allocates one with all values one (`T = Float32` by default);
+usually they come from [`circulant_similarity`](@ref) and [`circulant_adjacency`](@ref).
+Circulant matrices support `+`, `-`, broadcasting over their values (e.g. `m .* A` with
+`m` of size `(1, 1, h, b)`), `sum(A; dims)`, `cat(A, B; dims=3)`, `reshape` and `dot`, and
+are applied to signals with [`⊗`](@ref circulant_attention) and
+[`⨷`](@ref circulant_mh_attention).
+"""
 struct Circulant{T, N, M, S, A<:AbstractArray{T, N}} <: AbstractArray{T, N}
     data::A
     kernel_length::Int
@@ -20,153 +38,221 @@ Circulant(A::Circulant) = A
 Circulant(a::T, M, spatdims) where T <: Number = a
 
 function Adapt.adapt_structure(to, A::Circulant{T, N, M}) where {T, N, M}
-    data = Adapt.adapt_structure(to, A.data)
-    Circulant(data, M, A.spatial_size)
+    Circulant(Adapt.adapt_structure(to, A.data), M, A.spatial_size)
+end
+
+# Compat: some CUDA.jl versions (e.g. the CUDACore/cuSPARSE restructure) ship
+# without a KernelAdaptor rule for the batched CuSparseArrayCSR. The generic
+# adapt fallback then silently passes the host array through, and kernels
+# taking a Circulant fail with "passing non-bitstype argument". Define the
+# rule only when missing — defining it unconditionally would overwrite the
+# upstream method on versions that have it (an error under precompilation).
+# The fully-parameterized inner constructor is used because the convenience
+# constructors vary across GPUArrays versions; the last type parameter is the
+# address space (1 = global memory).
+const _KernelAdaptorT  = isdefined(CUDA, :KernelAdaptor) ? CUDA.KernelAdaptor : CUDA.CUDACore.KernelAdaptor
+const _CuDeviceArrayT  = isdefined(CUDA, :CuDeviceArray) ? CUDA.CuDeviceArray : CUDA.CUDACore.CuDeviceArray
+
+# (a) Versions whose adapt rule exists but calls an unparameterized
+# GPUSparseDeviceArrayCSR(rowPtr, colVal, nzVal, dims, nnz) convenience
+# constructor that GPUArrays never defines (only the {Tv,Ti,Vi,Vv,N} form
+# exists): supply the missing constructor, deriving every type parameter
+# (including the address space A) from the device arrays.
+# probe with concrete types — abstract ones can't match methods that
+# constrain type parameters across arguments
+const _ctor_probe = Tuple{_CuDeviceArrayT{Int32,2,1}, _CuDeviceArrayT{Int32,2,1},
+                          _CuDeviceArrayT{Float32,2,1}, NTuple{3,Int}, Int32}
+if isdefined(GPUArrays, :GPUSparseDeviceArrayCSR) &&
+   !hasmethod(GPUArrays.GPUSparseDeviceArrayCSR, _ctor_probe)
+    @eval function GPUArrays.GPUSparseDeviceArrayCSR(
+            rowPtr::$_CuDeviceArrayT{Ti,M,A}, colVal::$_CuDeviceArrayT{Ti,M,A},
+            nzVal::$_CuDeviceArrayT{Tv,M,A}, dims::NTuple{N,Int}, nnz::Integer,
+        ) where {Ti,Tv,M,A,N}
+        GPUArrays.GPUSparseDeviceArrayCSR{Tv, Ti, typeof(rowPtr), typeof(nzVal), N, M, A}(
+            rowPtr, colVal, nzVal, dims, Ti(nnz))
+    end
+end
+
+# (b) Versions missing the batched-CSR adapt rule entirely (the generic adapt
+# fallback then silently passes the host array through and kernels fail with
+# "passing non-bitstype argument"): define the rule.
+if isdefined(GPUArrays, :GPUSparseDeviceArrayCSR) &&
+   !hasmethod(Adapt.adapt_structure, Tuple{_KernelAdaptorT, CuSparseArrayCSR})
+    @eval function Adapt.adapt_structure(to::$_KernelAdaptorT, A::CuSparseArrayCSR{T,Ti,N}) where {T,Ti,N}
+        rowPtr = Adapt.adapt(to, A.rowPtr)
+        colVal = Adapt.adapt(to, A.colVal)
+        nzVal  = Adapt.adapt(to, A.nzVal)
+        GPUArrays.GPUSparseDeviceArrayCSR{T, Ti, typeof(rowPtr), typeof(nzVal), N, N-1, 1}(
+            rowPtr, colVal, nzVal, size(A), Ti(A.nnz))
+    end
 end
 
 CUDA.unsafe_free!(A::Circulant) = CUDA.unsafe_free!(A.data)
 
+"""
+    circulant(M, x)
+
+All-ones [`Circulant`](@ref) with window width `M` for the spatial size and batch of `x`,
+a `(spatial..., channels, batch)` array, with element type `real(eltype(x))`.
+"""
 circulant(M::Int, x::AnyCuArray{T, N}) where {T,N} = Circulant{real(T)}(M, (size(x)[1:N-2]..., 1, size(x,N)))
 
+"Window width `M` of `A` (odd); each row has `M^spatial_dims(A)` entries."
 kernel_length(A::Circulant{T, N, M}) where {T, N, M} = M
+"Number of spatial dimensions (1 or 2) of the signals `A` acts on."
 spatial_dims(A::Circulant{T, N, M, S}) where {T, N, M, S} = S
+"Spatial size of the signals `A` acts on; `prod(spatial_size(A)) == size(A, 1)`."
 spatial_size(A::Circulant) = A.spatial_size
 
+"""
+    windowview(A::Circulant)
+
+The values of `A` as a dense `(M^S, P, h, b)` array sharing memory with `A`:
+`windowview(A)[k, i, ...]` is the `k`-th window entry of row `i`. The normalizations
+(softmax, [`sparsemax`](@ref), [`entmax`](@ref)) act along its first dimension.
+"""
+windowview(A::Circulant) = windowview(A.data)
+windowview(A::CuSparseArrayCSR) = reshape(A.nzVal, :, A.dims[1], A.dims[3:end]...)
+
 Base.eltype(A::Circulant{T}) where T = T
-Base.size(A::Circulant) = size(A.data)
-Base.size(A::Circulant, i::Int) = size(A.data, i)
-Base.ndims(A::Circulant) = ndims(A.data)
+Base.size(A::Circulant)              = size(A.data)
+Base.size(A::Circulant, i::Int)      = size(A.data, i)
+Base.ndims(A::Circulant)             = ndims(A.data)
 Base.getindex(A::Circulant, idxs...) = Base.getindex(A.data, idxs...)
+Base.copy(A::Circulant{T,N,M})    where {T,N,M} = Circulant(copy(A.data), M, spatial_size(A))
 
-Base.similar(A::Circulant{T, N, M}) where {T, N, M} = Circulant(similar(A.data), M, spatial_size(A))
-Base.copy(A::Circulant{T, N, M}) where {T, N, M} = Circulant(copy(A.data), M, spatial_size(A))
+Base.similar(A::Circulant{T,N,M}) where {T,N,M} = Circulant(similar(A.data), M, spatial_size(A))
+Base.similar(A::Circulant{<:Any,N,M}, ::Type{T}) where {T,N,M} = Circulant(similar(A.data, T), M, spatial_size(A))
+Base.similar(A::CuSparseArrayCSR, ::Type{T}) where T = CuSparseArrayCSR(copy(A.rowPtr), copy(A.colVal), similar(A.nzVal, T), size(A))
 
-function Base.show(io::IOContext, m::MIME"text/plain", A::Circulant{T, N, M}) where {T, N, M}
+function Base.show(io::IOContext, m::MIME"text/plain", A::Circulant{T,N,M}) where {T,N,M}
     print(io, typeof(A), " with kernel-length $M, spatial-size $(spatial_size(A)), and data,\n")
     show(io, m, A.data)
 end
 
-function Base.repeat(A::Circulant{T, N, M}, dims::Int...) where {T, N, M}
-    data = repeat(A.data, dims...)
-    Circulant(data, M, spatial_size(A))
+# useful for showing the results of CircAtt.joint_softmax
+function Base.show(io::IO, m::MIME"text/plain", As::Tuple{Vararg{Circulant}})
+    print(io, length(As), "-tuple of Circulant matrices:\n")
+    for (i, A) in enumerate(As)
+        print(io, "  [$i] ")
+        show(io, m, A)
+        i < length(As) && print(io, "\n")
+    end
 end
 
-function Base.reshape(A::Circulant{T, N, M}, dims::Union{Colon,Int}...) where {T, N, M}
+function Base.repeat(A::Circulant{T,N,M}, dims::Int...) where {T,N,M}
+    Circulant(repeat(A.data, dims...), M, spatial_size(A))
+end
+
+function Base.reshape(A::Circulant{T,N,M}, dims::Union{Colon,Int}...) where {T,N,M}
     Circulant(reshape(A.data, dims...), M, spatial_size(A))
 end
 
-function _circulant_reshape(A::Circulant{T, N, M}, dims...) where {T, N, M}
-    reshape(A, dims...)
+function Base.cat(As::Circulant{T,N,M}...; dims=3) where {T,N,M}
+    Circulant(cat([A.data for A in As]...; dims=dims), M, spatial_size(first(As)))
 end
 
-function Base.cat(As::Circulant{T, N, M}...; dims=3) where {T, N, M}
-    Circulant(cat([A.data for A in As]...; dims=dims), M, spatial_size(A))
+# ------------------------------------------------------------------
+# Arithmetic
+#
+# Non-broadcasting +/- require identical sizes — use .+ / .- for
+# batch-expanding operations.
+# Scalar *, unary -, and CuArray * all delegate to broadcast.
+# ------------------------------------------------------------------
+
+function _check_same_size(X::Circulant, Y::Circulant)
+    size(X) == size(Y) || throw(DimensionMismatch(
+        "Circulant sizes $(size(X)) and $(size(Y)) must match for non-broadcasting " *
+        "arithmetic. Use .+ / .- for batch-expanding operations."
+    ))
 end
 
-function Base.:(+)(X::Circulant{T, N, M, S, A}, Y::Circulant{T, N, M, S, A}) where {T, N, M, S, A<:CuSparseArrayCSR}
-    data = CuSparseArrayCSR(copy(X.data.rowPtr), copy(X.data.colVal), X.data.nzVal + Y.data.nzVal, size(X))
-    Circulant(data, M, spatial_size(X))
+function Base.:(+)(X::Circulant{Tx,N,M,S,A}, Y::Circulant{Ty,N,M,S,A}) where {Tx,Ty,N,M,S,A<:CuSparseArrayCSR}
+    _check_same_size(X, Y)
+    X .+ Y
 end
 
-function Base.:(-)(X::Circulant{T, N, M, S, A}, Y::Circulant{T, N, M, S, A}) where {T, N, M, S, A<:CuSparseArrayCSR}
-    data = CuSparseArrayCSR(copy(X.data.rowPtr), copy(X.data.colVal), X.data.nzVal - Y.data.nzVal, size(X))
-    Circulant(data, M, spatial_size(X))
+function Base.:(-)(X::Circulant{Tx,N,M,S,A}, Y::Circulant{Ty,N,M,S,A}) where {Tx,Ty,N,M,S,A<:CuSparseArrayCSR}
+    _check_same_size(X, Y)
+    X .- Y
 end
 
-function Base.:(*)(c::Number, X::Circulant{T, N, M, S, A}) where {T, N, M, S, A <: CuSparseArrayCSR}
-    data = CuSparseArrayCSR(copy(X.data.rowPtr), copy(X.data.colVal), c .* X.data.nzVal, size(X))
-    Circulant(data, M, spatial_size(X))
-end
-Base.:(-)(A::Circulant) = -1*A
-Base.:(*)(A::Circulant, c::Number) = c*A
+Base.:(-)(X::Circulant) = -one(eltype(X)) .* X
 
-function LinearAlgebra.dot(X::Circulant{T, N, M, S, A}, Y::Circulant{T, N, M, S, A}) where {T, N, M, S, A <: CuSparseArrayCSR}
-    return dot(X.data.nzVal, Y.data.nzVal)
+# ------------------------------------------------------------------
+# Dot product — operates on nzVal directly
+# ------------------------------------------------------------------
+
+function LinearAlgebra.dot(X::Circulant{Tx,N,M,S,A}, Y::Circulant{Ty,N,M,S}) where {Tx,Ty,N,M,S,A<:CuSparseArrayCSR}
+    dot(X.data.nzVal, Y.data.nzVal)
 end
+
+# ------------------------------------------------------------------
+# Equality
+# ------------------------------------------------------------------
 
 function Base.:(==)(A::CuSparseArrayCSR, B::CuSparseArrayCSR)
-    if axes(A) != axes(B)
-        return false
-    end
-    if A.nzVal != B.nzVal
-        return false
-    end
-    if A.rowPtr != B.rowPtr
-        return false
-    end
-    if A.colVal != B.colVal
-        return false
-    end
+    axes(A)  == axes(B)  || return false
+    A.nzVal  == B.nzVal  || return false
+    A.rowPtr == B.rowPtr || return false
+    A.colVal == B.colVal || return false
     return true
 end
 
 function Base.:(==)(A::Circulant, B::Circulant)
-    if axes(A) != axes(B)
-        return false
-    end
-    if spatial_size(A) != spatial_size(B)
-        return false
-    end
-    if kernel_length(A) != kernel_length(B)
-        return false
-    end
-    if A.data != B.data
-        return false
-    end
+    axes(A)          == axes(B)          || return false
+    spatial_size(A)  == spatial_size(B)  || return false
+    kernel_length(A) == kernel_length(B) || return false
+    A.data           == B.data           || return false
     return true
 end
 
+# ------------------------------------------------------------------
+# Sum helpers for CuSparseArrayCSR
+#
+# nzVal layout: (nnz_per_row, n_rows, batch...)
+# Circulant dim k+1 corresponds to nzVal dim k for batch dims (k>1).
+#
+# sumdim1:  sum over rows   (Circulant dim 1) -> dense
+# sumdim2:  sum over cols   (Circulant dim 2) -> dense
+# sumdim3:  sum over batch  (Circulant dim >2) -> sparse, same pattern
+# sumdim12: sum over rows+cols -> scalar-per-batch
+# ------------------------------------------------------------------
+
 function sumdim1(A::CuSparseArrayCSR{T}) where T
+    # Aᵀ * ones gives column sums; use dim=2 size 2 to avoid n==1 errors
     o = CUDA.ones(T, (size(A,1), 2, prod(size(A)[3:end])))
-    # second dim is 2 bc n==1 causes errors
-    s =  batched_transpose(reshape(A, :, :, :)) ⊠ o
-    reshape(s[:,1,:], (1, size(A, 1), size(A)[3:end]...))
+    s = batched_transpose(reshape(A, :, :, :)) ⊠ o
+    reshape(s[:,1,:], (1, size(A,1), size(A)[3:end]...))
 end
 
 function sumdim2(A::CuSparseArrayCSR)
-    V = reshape(A.nzVal, :, size(A, 1), size(A)[3:end]...)
-    s = sum(V; dims=1)
-    return reshape(s, size(A,1), 1, size(A)[3:end]...)
-end
-
-function sumdim3(A::CuSparseArrayCSR, i::Int)
-    @assert i > 2 "sumdim3 can only sum batch dimensions of a CSR"
-    nzVal = sum(A.nzVal; dims=i-1)
-    rowPtr = selectdim(A.rowPtr, i-1, 1:1) |> copy
-    colVal = selectdim(A.colVal, i-1, 1:1) |> copy
-    dims = ntuple(d -> d == i ? 1 : size(A,d), ndims(A))
-    return CuSparseArrayCSR(rowPtr, colVal, nzVal, dims)
+    # windowview dim 1 is nnz_per_row (= kernel entries per row = col dimension)
+    s = sum(windowview(A); dims=1)
+    reshape(s, size(A,1), 1, size(A)[3:end]...)
 end
 
 function sumdim3(A::CuSparseArrayCSR, dims::Int...)
-    @assert all(dims .> 2) "sumdim3 can only sum batch dimensions of a CSR"
-    nzVal = sum(A.nzVal; dims = dims .- 1)
-    idx = ntuple(i->i + 1 ∈ dims ? (1:1) : Colon(), ndims(A)-1)
-    rowPtr = getindex(A.rowPtr, idx...) |> copy
-    colVal = getindex(A.colVal, idx...) |> copy
-    dims = ntuple(i -> i ∈ dims ? 1 : size(A,i), ndims(A))
-    return CuSparseArrayCSR(rowPtr, colVal, nzVal, dims)
+    @assert all(dims .> 2) "sumdim3 only reduces batch dims (dims > 2)"
+    nzVal  = sum(A.nzVal; dims=dims .- 1)
+    idx    = ntuple(i -> (i + 1) ∈ dims ? (1:1) : Colon(), ndims(A) - 1)
+    rowPtr = copy(getindex(A.rowPtr, idx...))
+    colVal = copy(getindex(A.colVal, idx...))
+    CuSparseArrayCSR(rowPtr, colVal, nzVal, ntuple(i -> i ∈ dims ? 1 : size(A,i), ndims(A)))
 end
 
 function sumdim12(A::CuSparseArrayCSR)
     s = sum(A.nzVal; dims=1)
-    return reshape(s, 1, size(s)...)
+    reshape(s, 1, size(s)...)
 end
 
 function Base.sum(A::CuSparseArrayCSR; dims=:)
-    if dims == 1
-        return sumdim1(A)
-    elseif dims == 2
-        return sumdim2(A)
-    elseif dims == Colon()
-        return sum(A.nzVal)
-    elseif all(dims .> 2)
-        return sumdim3(A, dims...)
-    elseif dims == (1,2)
-        return sumdim12(A)
-    else
-        throw(ErrorException("dims=$dims not implemented."))
-    end
+    dims == 1       && return sumdim1(A)
+    dims == 2       && return sumdim2(A)
+    dims == (1,2)   && return sumdim12(A)
+    dims == Colon() && return sum(A.nzVal)
+    all(dims .> 2)  && return sumdim3(A, dims...)
+    throw(ErrorException("dims=$dims not implemented for CuSparseArrayCSR."))
 end
 
 function Base.sum(A::Circulant; dims=:)
@@ -175,16 +261,3 @@ function Base.sum(A::Circulant; dims=:)
     end
     return sum(A.data; dims=dims)
 end
-
-function scale(c::CuArray{Tc,N}, A::CuSparseArrayCSR{Ta,Ti,N}) where {Tc, Ta, Ti, N}
-    @assert size(c, 1) == 1 && size(c, 2) == 1 "Scaling of non-batchdims of CuSparseArrayCSR not implemented"
-    nzVal = selectdim(c, 1, 1) .* A.nzVal
-    rowPtr = repeat(A.rowPtr, 1, ntuple(i->size(nzVal,i+1) ÷ size(A.rowPtr,i+1),N-2)...)
-    colVal = repeat(A.colVal, 1, ntuple(i->size(nzVal,i+1) ÷ size(A.colVal,i+1),N-2)...)
-    return CuSparseArrayCSR(rowPtr, colVal, nzVal, (size(A,1), size(A,2), size(nzVal)[2:end]...))
-end
-scale(c::CuArray{T1,N}, A::Circulant{T2,N,M}) where {T1,T2,N,M} = Circulant(scale(c, A.data), M, spatial_size(A))
-scale(c, A) = c .* A
-
-Base.:(*)(c::CuArray, A::Circulant) = scale(c, A)
-

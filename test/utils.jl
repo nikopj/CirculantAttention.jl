@@ -1,3 +1,38 @@
+# ============================================================
+# Helpers
+# ============================================================
+ 
+# selectdim on the last dimension — works regardless of nzVal rank
+nz_batch(nzVal, b) = Array(selectdim(nzVal, ndims(nzVal), b))
+nz_cpu(A::Circulant) = Array(A.data.nzVal)
+
+# Build a random Circulant with known sparsity pattern.
+function make_circulant(elty, spatdims, ws, batch)
+    x = CUDA.randn(elty, spatdims..., size_d(elty), batch)
+    circulant_similarity(CircAtt.DotSimilarity(), x, x, ws)
+end
+
+# Random tangent with same sparsity pattern, random nzVal.
+function rand_tangent(A::Circulant{T}) where T
+    B = copy(A)
+    B.data.nzVal .= CUDA.randn(T, size(A.data.nzVal)...)
+    return B
+end
+
+function rand_csr_tangent(A::Circulant{T}) where T
+    CuSparseArrayCSR(
+        copy(A.data.rowPtr), copy(A.data.colVal),
+        CUDA.randn(real(T), size(A.data.nzVal)...), size(A.data),
+    )
+end
+
+size_d(::Type{Float32})    = 4
+size_d(::Type{ComplexF32}) = 4
+
+# ============================================================
+# CRC and FD Utils
+# ============================================================
+ 
 function ChainRulesTestUtils.test_approx(actual::CuSparseArrayCSR, expected::CuSparseArrayCSR, msg="", args...; rtol=1e-6, atol=1e-6, kws...)
     @test_msg msg*" rowPtrs do not match." actual.rowPtr ≈ expected.rowPtr rtol=rtol atol=atol
     @test_msg msg*" colVals do not match." actual.colVal ≈ expected.colVal rtol=rtol atol=atol

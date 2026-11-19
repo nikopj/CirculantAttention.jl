@@ -8,6 +8,7 @@ makedocs(;
     authors="nikopj and contributors",
     repo="https://github.com/nikopj/CirculantAttention.jl/blob/{commit}{path}#{line}",
     sitename="CirculantAttention.jl",
+    checkdocs=:exports,
     format=Documenter.HTML(;
         prettyurls=get(ENV, "CI", "false") == "true",
         canonical="https://nikopj.github.io/CirculantAttention.jl",
@@ -16,6 +17,7 @@ makedocs(;
     ),
     pages=[
         "Home" => "index.md",
+        "API" => "api.md",
     ],
 )
 

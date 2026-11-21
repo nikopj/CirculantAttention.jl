@@ -52,7 +52,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         test_rrule(
             Circulant, A.data ⊢ rand_csr_tangent(A),
             kernel_length(A), spatial_size(A);
-            output_tangent=ΔA, rtol=1e-3, atol=1e-5, check_inferred=false,
+            output_tangent=ΔA, fdm=FDM, rtol=1e-3, atol=1e-5, check_inferred=false,
         )
     end
 
@@ -90,7 +90,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         Δout = copy(A)
         Δout.data.nzVal ./= sum(abs2, A.data.nzVal)
         test_rrule(*, c, A ⊢ ΔA;
-            output_tangent=Δout, rtol=1e-3, atol=1e-4, check_inferred=false)
+            output_tangent=Δout, fdm=FDM, rtol=1e-3, atol=1e-4, check_inferred=false)
     end
 
     # --------------------------------------------------------
@@ -162,7 +162,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         Δresult = rand_tangent(result)
         test_rrule(
             Base.sum, A ⊢ ΔA;
-            fkwargs=(dims=ndims(A),), output_tangent=Δresult,
+            fkwargs=(dims=ndims(A),), output_tangent=Δresult, fdm=FDM,
             rtol=1e-3, atol=1e-5, check_inferred=false,
         )
     end
@@ -189,7 +189,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         # such cancellation and passes at 1e-5.)
         test_rrule(
             Base.repeat, A ⊢ ΔA, reps...;
-            output_tangent=ΔArep, rtol=1e-3, atol=1e-4, check_inferred=false,
+            output_tangent=ΔArep, fdm=FDM, rtol=1e-3, atol=1e-4, check_inferred=false,
         )
     end
 
@@ -201,7 +201,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         ΔAcat = rand_tangent(Acat)
         test_rrule(
             Base.cat, A ⊢ ΔA, B ⊢ ΔB;
-            fkwargs=(dims=ndims(A),), output_tangent=ΔAcat,
+            fkwargs=(dims=ndims(A),), output_tangent=ΔAcat, fdm=FDM,
             rtol=1e-3, atol=1e-5, check_inferred=false,
         )
     end
@@ -223,7 +223,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         W = windowview(real(A)); stretch_support!(W)
         ΔW = similar(W); randn!(ΔW)
         V = similar(W); randn!(V)
-        test_rrule(sparsemax, W ⊢ ΔW, output_tangent=V,
+        test_rrule(sparsemax, W ⊢ ΔW, output_tangent=V, fdm=FDM,
             rtol=1e-3, atol=1e-3, check_inferred=false,
         )
     end
@@ -232,18 +232,20 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         W = windowview(real(A)); densify!(W)
         ΔW = similar(W); randn!(ΔW)
         V = similar(W); randn!(V)
-        test_rrule(entmax, W ⊢ ΔW, 1.5f0 ⊢ (1f0 + rand()), output_tangent=V,
+        test_rrule(entmax, W ⊢ ΔW, 1.5f0 ⊢ (1f0 + rand()), output_tangent=V, fdm=FDM,
             rtol=1e-3, atol=1e-3, check_inferred=false,
         )
     end
 
     @testset "entmax, α array [$tag]" begin
-        α  = 1f0 .+ CUDA.rand(Float32, 1, 1, 2, 1)
+        # entmax's exponent 1/(α-1) blows up the forward's Float32 rounding as α → 1,
+        # and finite differences in α then measure that noise; keep α ≥ 1.25.
+        α  = 1.25f0 .+ 0.75f0 .* CUDA.rand(Float32, 1, 1, 2, 1)
         W  = windowview(real(A .* α)); densify!(W)
         ΔW = similar(W); randn!(ΔW)
         V  = similar(W); randn!(V)
         Δα = CUDA.rand(Float32, 1, 1, 2, 1)
-        test_rrule(entmax, W ⊢ ΔW, α ⊢ Δα, output_tangent=V,
+        test_rrule(entmax, W ⊢ ΔW, α ⊢ Δα, output_tangent=V, fdm=FDM,
             rtol=1e-3, atol=1e-3, check_inferred=false,
         )
     end

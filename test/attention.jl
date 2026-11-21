@@ -15,8 +15,11 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
     u = CUDA.randn(elty, spatdims..., d, B)
     v = CUDA.randn(elty, spatdims..., d, B)
 
+    # PI similarities take |x⋅y|; their inputs keep every dot product off its kink at 0
+    xpi = pi_safe_rand(elty, spatdims..., d, B)
+    ypi = pi_safe_rand(elty, spatdims..., d, B)
+
     # Reference Circulants for output tangents.
-    # nzVals are offset from zero to avoid sign discontinuities in PI variants.
     A = circulant_similarity(RealDotSimilarity(), x, y, ws)
     B_circ = copy(A)
     C_circ = copy(A)
@@ -36,27 +39,27 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
 
     @testset "circulant_similarity RealDotSimilarity [$tag]" begin
         test_rrule(circulant_similarity, RealDotSimilarity(), x ⊢ u, y ⊢ v, ws;
-            output_tangent=A, rtol=1e-3, atol=1e-5, check_inferred=false)
+            output_tangent=A, fdm=FDM, rtol=1e-3, atol=1e-5, check_inferred=false)
     end
 
     @testset "circulant_similarity DotSimilarity [$tag]" begin
         test_rrule(circulant_similarity, DotSimilarity(), x ⊢ u, y ⊢ v, ws;
-            output_tangent=Ac, rtol=1e-3, atol=1e-5, check_inferred=false)
+            output_tangent=Ac, fdm=FDM, rtol=1e-3, atol=1e-5, check_inferred=false)
     end
 
     @testset "circulant_similarity DistanceSimilarity [$tag]" begin
         test_rrule(circulant_similarity, DistanceSimilarity(), x ⊢ u, y ⊢ v, ws;
-            output_tangent=A, rtol=1e-3, atol=1e-5, check_inferred=false)
+            output_tangent=A, fdm=FDM, rtol=1e-3, atol=1e-5, check_inferred=false)
     end
 
     @testset "circulant_similarity PIDotSimilarity [$tag]" begin
-        test_rrule(circulant_similarity, PIDotSimilarity(), x ⊢ u, y ⊢ v, ws;
-            output_tangent=A, rtol=1e-3, atol=1e-5, check_inferred=false)
+        test_rrule(circulant_similarity, PIDotSimilarity(), xpi ⊢ u, ypi ⊢ v, ws;
+            output_tangent=A, fdm=FDM, rtol=1e-3, atol=1e-5, check_inferred=false)
     end
 
     @testset "circulant_similarity PIDistanceSimilarity [$tag]" begin
-        test_rrule(circulant_similarity, PIDistanceSimilarity(), x ⊢ u, y ⊢ v, ws;
-            output_tangent=A, rtol=1e-3, atol=1e-5, check_inferred=false)
+        test_rrule(circulant_similarity, PIDistanceSimilarity(), xpi ⊢ u, ypi ⊢ v, ws;
+            output_tangent=A, fdm=FDM, rtol=1e-3, atol=1e-5, check_inferred=false)
     end
 
     # ------------------------------------------------------------------
@@ -66,24 +69,24 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
 
     @testset "circulant_attention (real sim, real features) [$tag]" begin
         test_rrule(circulant_attention, A ⊢ B_circ, x ⊢ u;
-            output_tangent=v, rtol=1e-3, atol=1e-5, check_inferred=false)
+            output_tangent=v, fdm=FDM, rtol=1e-3, atol=1e-5, check_inferred=false)
     end
 
     # Complex Circulant only meaningful for ComplexF32
     if elty == ComplexF32
         @testset "circulant_attention (complex sim, complex features) [$tag]" begin
             test_rrule(circulant_attention, Ac ⊢ Bc, x ⊢ u;
-                output_tangent=v, rtol=1e-3, atol=1e-5, check_inferred=false)
+                output_tangent=v, fdm=FDM, rtol=1e-3, atol=1e-5, check_inferred=false)
         end
 
         @testset "circulant_attention (complex sim, real features) [$tag]" begin
             test_rrule(circulant_attention, Ac ⊢ Bc, real(x) ⊢ real(u);
-                output_tangent=v, rtol=1e-3, atol=1e-5, check_inferred=false)
+                output_tangent=v, fdm=FDM, rtol=1e-3, atol=1e-5, check_inferred=false)
         end
 
         @testset "circulant_attention (mixed: real sim, complex features) [$tag]" begin
             test_rrule(circulant_attention, A ⊢ Bc, x ⊢ u;
-                output_tangent=v, rtol=1e-3, atol=1e-5, check_inferred=false)
+                output_tangent=v, fdm=FDM, rtol=1e-3, atol=1e-5, check_inferred=false)
         end
     end
 
@@ -94,7 +97,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
 
     @testset "softmax (Circulant) [$tag]" begin
         test_rrule(NNlib.softmax, A ⊢ B_circ;
-            output_tangent=C_circ, rtol=1e-3, atol=1e-3, check_inferred=false)
+            output_tangent=C_circ, fdm=FDM, rtol=1e-3, atol=1e-3, check_inferred=false)
     end
 
     # ------------------------------------------------------------------

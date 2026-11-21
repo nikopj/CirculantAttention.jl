@@ -21,14 +21,12 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         (RealDotSimilarity(), DistanceSimilarity(), PIDotSimilarity(), PIDistanceSimilarity()) :
         (DotSimilarity(), RealDotSimilarity(), DistanceSimilarity(), PIDotSimilarity(), PIDistanceSimilarity())
 
-    # PIDot/PIDistance gradients use sign(z)/abs(z) of the dot z=Σq·conj(k), which
-    # is non-differentiable at z=0. When a window entry's dot lands near zero,
-    # FiniteDifferences perturbs across the sign flip and disagrees with the exact
-    # analytic rrule there — a fragility that grows with window size (25 entries in
-    # 2D vs 5 in 1D). The rrule is correct; only the FD reference is unreliable, so
-    # loosen tolerance for those two similarities (mirrors the entmax boundary case).
-    _rrule_tol(sf) = sf isa Union{PIDotSimilarity, PIDistanceSimilarity} ?
-                     (rtol=1e-2, atol=1e-3) : (rtol=1e-3, atol=1e-5)
+    # PIDot/PIDistance take |z| of the dot z = Σ q⋅conj(k), which has a kink at z = 0.
+    # FiniteDifferences across it disagrees with the exact rrule, so the rrule checks
+    # of those two similarities draw q and k with every window dot product off 0.
+    ispi(sf) = sf isa Union{PIDotSimilarity, PIDistanceSimilarity}
+    qpi = pi_safe_rand(elty, spatdims..., d, B)
+    kpi = pi_safe_rand(elty, spatdims..., d, B)
 
     for simfun in simfuns
         @testset "forward $(typeof(simfun)) [$tag]" begin
@@ -49,13 +47,14 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         # rrule of the fused core against FiniteDifferences (the public wrapper
         # only adds the τ-scaling broadcast, which Zygote traces)
         @testset "rrule $(typeof(simfun)) [$tag]" begin
+            qs, ks = ispi(simfun) ? (qpi, kpi) : (q, k)
             test_rrule(CircAtt._circulant_flash_attention, simfun,
-                q ⊢ CUDA.randn(elty, size(q)...),
-                k ⊢ CUDA.randn(elty, size(k)...),
+                qs ⊢ CUDA.randn(elty, size(q)...),
+                ks ⊢ CUDA.randn(elty, size(k)...),
                 v ⊢ CUDA.randn(elty, size(v)...),
                 ws;
                 output_tangent=CUDA.randn(elty, size(v)...),
-                _rrule_tol(simfun)..., check_inferred=false)
+                fdm=FDM_SMOOTH, rtol=1e-3, atol=1e-5, check_inferred=false)
         end
     end
 
@@ -157,7 +156,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
             v ⊢ CUDA.randn(elty, size(v)...),
             ws;
             output_tangent=(CUDA.randn(elty, size(v)...), CUDA.randn(real(elty), nrows, B)),
-            rtol=1e-3, atol=1e-5, check_inferred=false)
+            fdm=FDM_SMOOTH, rtol=1e-3, atol=1e-5, check_inferred=false)
     end
 
     # multi-head: compare against the composed path on manually split heads
@@ -189,13 +188,14 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         end
 
         @testset "transposed rrule $(typeof(simfun)) [$tag]" begin
+            qs, ks = ispi(simfun) ? (qpi, kpi) : (q, k)
             test_rrule(CircAtt._circulant_flash_transposed_attention, simfun,
-                q ⊢ CUDA.randn(elty, size(q)...),
-                k ⊢ CUDA.randn(elty, size(k)...),
+                qs ⊢ CUDA.randn(elty, size(q)...),
+                ks ⊢ CUDA.randn(elty, size(k)...),
                 CUDA.randn(elty, size(q)...) ⊢ CUDA.randn(elty, size(q)...),
                 ws;
                 output_tangent=CUDA.randn(elty, size(q)...),
-                _rrule_tol(simfun)..., check_inferred=false)
+                fdm=FDM_SMOOTH, rtol=1e-3, atol=1e-5, check_inferred=false)
         end
     end
 

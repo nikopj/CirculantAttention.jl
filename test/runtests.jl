@@ -22,13 +22,13 @@ if CUDA.functional()
     include("utils.jl")
 
     @testset "CirculantAttention.jl" begin
-        include("array.jl")
-        include("attention.jl")
-        include("rrules.jl")
-        include("correctness.jl")
-        include("flash.jl")
-        include("flash_entmax.jl")
-        include("grad.jl")
+        for file in ("array.jl", "attention.jl", "rrules.jl", "correctness.jl",
+                     "flash.jl", "flash_entmax.jl", "grad.jl")
+            # reseed per file, so a file's draws do not depend on the files run before it
+            Random.seed!(1234)
+            CUDA.seed!(1234)
+            include(file)
+        end
     end
 else
     @warn "CUDA is not functional; CirculantAttention needs an NVIDIA GPU, so the tests are skipped."

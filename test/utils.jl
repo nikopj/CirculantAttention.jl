@@ -29,6 +29,17 @@ end
 size_d(::Type{Float32})    = 4
 size_d(::Type{ComplexF32}) = 4
 
+# Inputs for PIDot/PIDistance gradient checks. Their similarity takes |x⋅y|, which has a
+# kink at x⋅y = 0, and finite differences across it are wrong. Entries of magnitude in
+# [0.5, 1.5) (real part, for complex) with one random sign per pixel keep every dot product
+# at |x⋅y| ≥ d/4 while still drawing both signs.
+function pi_safe_rand(elty, dims...)
+    R = real(elty)
+    x = CUDA.rand(R, dims...) .+ R(0.5)
+    elty <: Complex && (x = complex.(x, CUDA.rand(R, dims...)))
+    sign.(CUDA.randn(R, dims[1:end-2]..., 1, dims[end])) .* x
+end
+
 # ============================================================
 # CRC and FD Utils
 # ============================================================
@@ -43,8 +54,25 @@ function ChainRulesTestUtils.test_approx(actual::Circulant, expected::Circulant,
     ChainRulesTestUtils.test_approx(actual.data, expected.data, msg, args...; kws...)
 end
 
-FD.to_vec(x::CuVector{<:Real}) = Array(x), cu
-FD.to_vec(x::CuArray{<:Real}) = FD.to_vec(vec(x))[1], y->reshape(cu(y), size(x)...)
+# FiniteDifferences combines its stencil in the eltype of the vectors it perturbs. In
+# Float32, every output the perturbation does not touch keeps the same rounding residual,
+# which shifts the whole reference j′vp by an amount that grows with the number of outputs
+# (the 2D tests have 40× as many as the 1D ones). So the finite differences run on Float64
+# vectors around the Float32 functions, and FDM's `factor` tells the step selection that
+# the function values are only Float32-accurate (eps(Float32)/eps(Float64) ≈ 5e8).
+# Every test_rrule call passes fdm=FDM, or FDM_SMOOTH below.
+const FDM = FD.central_fdm(5, 1; max_range=1e-2, factor=1e9)
+
+# max_range caps the step, which FDM keeps small for sparsemax/entmax support boundaries.
+# The Float32 rounding of the forward enters the estimate divided by the step, and through
+# a softmax over 2D windows it can exceed rtol=1e-3 (flash attention with PIDistance).
+# The flash kernels are smooth within ±0.1 of their inputs (for the PI similarities, of
+# pi_safe_rand inputs), so their checks may take steps 10× wider.
+const FDM_SMOOTH = FD.central_fdm(5, 1; max_range=1e-1, factor=1e9)
+
+FD.to_vec(x::Float32) = [Float64(x)], v -> Float32(only(v))
+FD.to_vec(x::CuVector{T}) where {T<:Real} = Float64.(Array(x)), v -> CuArray{T}(v)
+FD.to_vec(x::CuArray{T}) where {T<:Real} = first(FD.to_vec(vec(x))), v -> reshape(CuArray{T}(v), size(x))
 function FD.to_vec(A::CuSparseArrayCSR)
     x_vec, back = FD.to_vec(A.nzVal)
     function CuSparseArrayCSR_from_vec(x_v)

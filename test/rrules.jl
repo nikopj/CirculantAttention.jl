@@ -252,4 +252,19 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
 
 end  # for elty, nspatdims
 
+# Entries just inside the entmax support carry weight u = p^(2-α) in the pullback (1 for
+# sparsemax) and must not be dropped. The FD tests above stay in the dense regime, so
+# here each column has one entry with p ≈ 1e-4, and the pullback is checked against the
+# closed form ∂W = u .* (Δ .- Σ uΔ / Σ u) over the support p > 0.
+@testset "entmax pullback keeps small in-support entries, α=$α" for (α, col) in
+        ((1.5f0, Float32[1.9999, 0.02, -1]), (2f0, Float32[1, 2f-4, -1]))
+    W = cu(repeat(col, 1, 2))
+    p = Array(entmax(W, α))
+    @test 0 < p[2, 1] < 1f-3
+    Δ = randn(Float32, size(W))
+    _, back = rrule(entmax, W, α)
+    u = ifelse.(p .> 0, p .^ (2 - α), 0f0)
+    @test Array(back(cu(Δ))[2]) ≈ u .* (Δ .- sum(u .* Δ; dims=1) ./ sum(u; dims=1))  rtol=1e-4 atol=1e-6
+end
+
 end  # @testset

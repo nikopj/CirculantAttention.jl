@@ -93,8 +93,10 @@ function joint_entmax(α, As::Circulant...)
     return ntuple(i -> _circ_from_window(splits[i], As[i]), length(As))
 end
 
+# The support is p > 0, as in the flash kernels. Entries just inside it still carry
+# weight p^(2-α) (up to 1 for α=2), so a small-p cutoff would bias the gradient.
 function _entmax_pullback_z(Δp::AbstractArray, p::AbstractArray, W::AbstractArray, α)
-    mask    = p .> sqrt(eps(eltype(p)))
+    mask    = p .> zero(eltype(p))
     w       = ifelse.(mask, p .^ (2f0 .- α), zero(eltype(p)))   # p_i^(2-α)
     W_sum   = sum(w; dims=1)
     # Weighted upstream sum: sum_{i∈S} Δp_i * w_i
@@ -107,7 +109,7 @@ function _entmax_pullback_z(Δp::AbstractArray, p::AbstractArray, W::AbstractArr
 end
 
 function _entmax_pullback_α(Δp::CuArray, p::CuArray, W::CuArray, α)
-    mask    = p .> sqrt(eps(eltype(p)))
+    mask    = p .> zero(eltype(p))
     w     = ifelse.(mask, p .^ (2f0 .- α), zero(eltype(p)))   # p_i^(2-α)
     W_sum = sum(w; dims=1)
     logp  = ifelse.(mask, log.(p .+ _ENTMAX_EPS), zero(eltype(p)))

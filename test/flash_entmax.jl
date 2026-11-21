@@ -62,13 +62,11 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
             @test Array(y_fl) ≈ Array(y_ref)  rtol=1e-3 atol=1e-5
         end
 
-        # α-entmax gradients are discontinuous at the support boundary: the flash
-        # Halley τ and the composed path's bisection τ differ by ~1e-7, so for a
-        # window entry straddling the boundary the two paths make opposite
-        # in/out-of-support choices and that entry's gradient legitimately differs
-        # (the entmax analog of the sparsemax subgradient jump). This is isolated
-        # to boundary entries; a real bug perturbs the whole array. Tolerance is
-        # loosened accordingly (forward, which is continuous, stays tight above).
+        # The sparsemax (α=2) gradient jumps at the support boundary, and the flash
+        # Halley τ and the composed path's τ (bisection, or a sort for α=2) differ in
+        # the last bits, so an entry sitting on the boundary can be in one path's
+        # support and not the other's. The looser tolerance covers that; for α < 2
+        # the gradient is continuous there (forward stays tight above).
         @testset "gradient $(typeof(sim)) α=$α [$tag]" begin
             g_ref = Zygote.gradient((q, k, v) -> sum(abs2, _entmax_ref(sim, α, q, k, v, ws)), q, k, v)
             g_fl  = Zygote.gradient((q, k, v) -> sum(abs2, circulant_flash_attention(es, q, k, v, ws)), q, k, v)
@@ -110,8 +108,8 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
         @test Array(y_flss) ≈ Array(y_ref)   rtol=1e-3 atol=1e-5
         @test Array(y_flss) ≈ Array(y_fle2)  rtol=1e-5 atol=1e-7
 
-        # sparsemax gradient is likewise subgradient-discontinuous at the support
-        # boundary (see the entmax gradient note above) — loosened tolerance.
+        # sparsemax gradient jumps at the support boundary (see the entmax gradient
+        # note above) — looser tolerance.
         g_ref = Zygote.gradient((q, k, v) -> sum(abs2, _sparsemax_ref(sim, q, k, v, ws)), q, k, v)
         g_fl  = Zygote.gradient((q, k, v) -> sum(abs2, circulant_flash_attention(SparsemaxSimilarity(sim), q, k, v, ws)), q, k, v)
         for (gr, gf) in zip(g_ref, g_fl)
@@ -152,7 +150,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
             loss(f) = ((ya, yb) = f; sum(abs2, ya) + sum(abs2, yb))
             g_ref = Zygote.gradient((q,k,v) -> loss(ref(q,k,v)), q, k, v)
             g_fl  = Zygote.gradient((q,k,v) -> loss(circulant_flash_joint_attention(mk, q, k, v, Wsj)), q, k, v)
-            for (gr, gf) in zip(g_ref, g_fl)   # entmax boundary subgradient → loose tol
+            for (gr, gf) in zip(g_ref, g_fl)   # looser tol: see the gradient note above
                 @test Array(gf) ≈ Array(gr)  rtol=1e-2 atol=1e-3
             end
         end
@@ -219,7 +217,7 @@ for elty in TEST_ELTYPES, nspatdims in TEST_SPATDIMS
             Γu = circulant_flash_attention(mk, q, k, u, ws)
             @test sum(conj.(u) .* yt_fl) ≈ sum(conj.(Γu) .* x)  rtol=1e-3 atol=1e-5
 
-            # gradient vs composed (entmax boundary subgradient → loose tol)
+            # gradient vs composed (looser tol: see the gradient note above)
             g_ref = Zygote.gradient((q,k,x) -> sum(abs2, entref(mk, q, k, x)), q, k, x)
             g_fl  = Zygote.gradient((q,k,x) -> sum(abs2, circulant_flash_transposed_attention(mk, q, k, x, ws)), q, k, x)
             for (gr, gf) in zip(g_ref, g_fl)
